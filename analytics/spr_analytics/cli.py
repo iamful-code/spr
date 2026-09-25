@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from . import db, diagnostics, md, optimizer, pairs, roundtrips
+from . import auto, db, diagnostics, md, optimizer, pairs, roundtrips
 
 
 def parse_time(s: str) -> int:
@@ -135,6 +135,28 @@ def cmd_report(a) -> int:
     return 0
 
 
+def cmd_auto(a) -> int:
+    cfg = auto.AutoConfig(
+        db_path=a.db,
+        md_dir=a.md_dir,
+        config_dir=a.config_dir,
+        config_path=a.config,
+        bin_path=a.bin,
+        analyze_every_min=a.analyze_every,
+        pairs_every_min=a.pairs_every,
+        optimize_every_min=a.optimize_every,
+        optimize_hours=a.optimize_hours,
+        optimize_trials=a.trials,
+        apply=a.apply,
+        min_n=a.min_n,
+        cooldown_min=a.cooldown,
+        allow_top=a.allow_top,
+        once=a.once,
+    )
+    auto.run_auto(cfg)
+    return 0
+
+
 def cmd_clean(a) -> int:
     segs = md.list_segments(a.md_dir)
     cutoff = db.now_ms() - a.keep_days * 86_400_000
@@ -148,7 +170,7 @@ def cmd_clean(a) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(prog="spr_analytics", description="SPR analytics: diagnostics, pair scoring, optimizer")
+    p = argparse.ArgumentParser(prog="spr_analytics", description="SPR analytics: diagnostics, pair scoring, optimizer, autonomous loop")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("analyze", help="round trips, markouts, diagnostics -> recommendations")
@@ -182,6 +204,22 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--bin", help="path to the spr binary")
     s.add_argument("--seed", type=int, default=0)
     s.set_defaults(fn=cmd_optimize)
+
+    s = sub.add_parser("auto", help="autonomous loop: periodic analyze (+apply), pairs and optimize")
+    add_common(s)
+    s.add_argument("--analyze-every", type=float, default=10.0, help="minutes between diagnostics runs")
+    s.add_argument("--pairs-every", type=float, default=60.0, help="minutes between pair scoring runs (0 = off)")
+    s.add_argument("--optimize-every", type=float, default=0.0, help="minutes between optimizer runs (0 = off)")
+    s.add_argument("--optimize-hours", type=float, default=6.0, help="length of the replay window for the optimizer")
+    s.add_argument("--trials", type=int, default=30)
+    s.add_argument("--apply", action="store_true", help="write suggested parameters into overrides.json / symbols.json")
+    s.add_argument("--min-n", type=int, default=30)
+    s.add_argument("--cooldown", type=float, default=60.0, help="minutes before the same parameter of a symbol may change again")
+    s.add_argument("--allow-top", type=int, default=0)
+    s.add_argument("--config", default="config/strategy.toml")
+    s.add_argument("--bin", help="path to the spr binary")
+    s.add_argument("--once", action="store_true", help="run each step once and exit (for tests)")
+    s.set_defaults(fn=cmd_auto)
 
     s = sub.add_parser("report", help="text summary of the latest run")
     add_common(s)

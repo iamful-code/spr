@@ -33,14 +33,18 @@ def _round_sig(x: float, sig: int = 3) -> float:
     return float(f"{x:.{sig}g}")
 
 
-def run_diagnostics(conn: sqlite3.Connection, md_dir: str, run_id: int, min_n: int = 30) -> dict:
-    """Compute everything and return {"recommendations": [...], "per_symbol": DataFrame, "markouts": DataFrame, "summary": dict}."""
-    fills = db.fills(conn, run_id)
-    orders = db.orders(conn, run_id)
+def run_diagnostics(conn: sqlite3.Connection, md_dir: str, run_id: int, min_n: int = 30, since_ts: int | None = None) -> dict:
+    """Compute everything and return {"recommendations": [...], "per_symbol": DataFrame, "markouts": DataFrame, "summary": dict}.
+    `since_ts` restricts the evidence to fills and orders after that moment (the auto loop passes
+    the time of its last parameter change, so each change is judged on fresh data only)."""
+    fills = db.fills(conn, run_id, since_ts=since_ts)
+    orders = db.orders(conn, run_id, since_ts=since_ts)
     params_blob = db.latest_params(conn, run_id)
     run = conn.execute("SELECT started_ts, ended_ts FROM runs WHERE run_id = ?", (run_id,)).fetchone()
     started = int(run["started_ts"]) if run else 0
-    last_ts = int(max(fills["ts"].max() if len(fills) else 0, run["ended_ts"] or 0 if run else 0))
+    if since_ts:
+        started = max(started, int(since_ts))
+    last_ts = int(max(fills["ts"].max() if len(fills) else 0, run["ended_ts"] or 0 if run else 0, db.now_ms() if run and not run["ended_ts"] else 0))
     hours = max((last_ts - started) / 3.6e6, 1e-6) if started else 1e-6
 
     rts = roundtrips.match_roundtrips(fills)

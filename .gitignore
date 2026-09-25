@@ -5,6 +5,7 @@ data/
 *.db-shm
 config/overrides.json
 config/symbols.json
+config/auto_state.json
 logs/
 
 # rust

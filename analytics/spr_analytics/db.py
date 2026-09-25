@@ -60,10 +60,22 @@ def fills(conn: sqlite3.Connection, run_id: int | None = None, symbol: str | Non
     return read_df(conn, sql, params)
 
 
-def orders(conn: sqlite3.Connection, run_id: int | None = None) -> pd.DataFrame:
-    if run_id is None:
-        return read_df(conn, "SELECT * FROM orders ORDER BY ts_done")
-    return read_df(conn, "SELECT * FROM orders WHERE run_id = ? ORDER BY ts_done", (run_id,))
+def orders(conn: sqlite3.Connection, run_id: int | None = None, since_ts: int | None = None) -> pd.DataFrame:
+    sql = "SELECT * FROM orders WHERE 1=1"
+    params: list[Any] = []
+    if run_id is not None:
+        sql += " AND run_id = ?"
+        params.append(run_id)
+    if since_ts:
+        sql += " AND ts_done >= ?"
+        params.append(since_ts)
+    return read_df(conn, sql + " ORDER BY ts_done", params)
+
+
+def latest_trading_run_id(conn: sqlite3.Connection) -> int | None:
+    """Most recent live or sim run (replays are excluded)."""
+    row = conn.execute("SELECT run_id FROM runs WHERE mode != 'replay' ORDER BY started_ts DESC LIMIT 1").fetchone()
+    return int(row[0]) if row else None
 
 
 def symbol_stats(conn: sqlite3.Connection, run_id: int | None = None, since_ts: int | None = None) -> pd.DataFrame:

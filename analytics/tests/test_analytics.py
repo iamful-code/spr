@@ -132,6 +132,41 @@ def test_diagnostics_adverse_selection_and_losing_symbol(tmp_path):
     assert "BADUSDT" in out["symbols"]["deny"]
     assert out["overrides"]["BADUSDT"]["min_spread_bps"] == pytest.approx(12.5)
     assert db.strategy_params_for(db.latest_params(conn, run_id), "BADUSDT")["min_spread_bps"] == 10.0
+    # evidence window after the last change: nothing left to judge
+    res2 = diagnostics.run_diagnostics(conn, str(md_dir), run_id, min_n=30, since_ts=t0 + 7_100_000)
+    assert res2["summary"]["n"] == 0 and not [r for r in res2["recommendations"] if r["rule"] in ("adverse_selection", "losing_symbol")]
+
+
+def test_auto_loop_once_applies_with_cooldown(tmp_path, monkeypatch):
+    from spr_analytics import auto
+
+    conn, path = make_db(tmp_path)
+    t0 = 1_704_067_200_000
+    conn.execute("INSERT INTO runs(run_id, started_ts, ended_ts, mode) VALUES (1, ?, ?, 'sim')", (t0, t0 + 7_200_000))
+    conn.execute("INSERT INTO param_versions(run_id, version, ts, params_json) VALUES (1, 1, ?, ?)", (t0, json.dumps({"strategy": {"min_spread_bps": 10.0, "toxicity_imbalance": 0.6}, "overrides": {}})))
+    bbo = [(t0 + i * 1000, 0, 100.0 - i * 0.01, 100.02 - i * 0.01) for i in range(7200)]
+    md_dir = write_md(tmp_path, 1, ["BADUSDT"], bbo, [])
+    rows = []
+    oid = 1
+    for k in range(40):
+        t = t0 + 60_000 + k * 120_000
+        px = 100.0 - (t - t0) / 1000 * 0.01
+        rows.append(make_fill(oid, "BADUSDT", "Buy", px, 1.0, t)); oid += 1
+        rows.append(make_fill(oid, "BADUSDT", "Sell", px - 0.05, 1.0, t + 30_000, purpose="exit")); oid += 1
+    cols = list(rows[0].keys())
+    conn.executemany(f"INSERT INTO fills(run_id, {', '.join(cols)}) VALUES (1, {', '.join('?' * len(cols))})", [tuple(r[c] for c in cols) for r in rows])
+    conn.commit()
+    conn.close()
+    cfg = auto.AutoConfig(db_path=path, md_dir=str(md_dir), config_dir=str(tmp_path / "cfg"), apply=True, min_n=30, pairs_every_min=0, once=True)
+    auto.run_auto(cfg)
+    ov = json.load(open(tmp_path / "cfg" / "overrides.json"))
+    assert ov["BADUSDT"]["min_spread_bps"] == pytest.approx(12.5)
+    state = json.load(open(cfg.state_path))
+    assert "BADUSDT:min_spread_bps" in state["applied"]
+    # second pass: within cooldown and no fills after the change -> nothing new applied
+    auto.run_auto(cfg)
+    ov2 = json.load(open(tmp_path / "cfg" / "overrides.json"))
+    assert ov2 == ov
 
 
 def test_pairs_scoring(tmp_path):

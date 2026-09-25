@@ -45,6 +45,7 @@
 | `spr run` на реальном WS Bybit (5 мажоров, 150 с, инструменты из файла) | соединение, 10 тыс. событий, реальные котировки и сделки в БД и файлах; мажоры правильно отфильтрованы как `spread_low` (спред 0.01–1 bps) |
 | `python -m spr_analytics analyze` | 450 FIFO-кругов, markout поймал токсичный поток синтетики (SIM023USDT: −5.4 bps через 5 с), 7 рекомендаций |
 | `pairs`, `report`, `optimize --trials 6` | работают; оптимизатор нашёл параметры лучше базовых на отложенном отрезке |
+| `auto --once --apply` | автономный цикл: рекомендации записаны в overrides.json, повторный проход внутри cooldown ничего не меняет |
 | дашборд | все эндпоинты 200, страница отрисовывается (скриншоты в headless Chromium) |
 | `pytest analytics/tests` | 4 теста |
 
@@ -111,8 +112,10 @@
    уровня при `improve`).
 3. **Оптимизатор на реальной записи**: `optimize --from ... --to ... --trials 100 --apply`;
    параметры per-symbol для лучших пар из `pairs`.
-4. **Автоматизация цикла**: cron/systemd-таймер `analyze --apply` и `pairs` раз в час,
-   `optimize` раз в сутки, `clean --keep-days 14`.
+4. **Автономный цикл** уже есть (`python -m spr_analytics auto --apply [--optimize-every 360]`):
+   analyze каждые 10 мин с cooldown 60 мин на параметр и оценкой только по сделкам после
+   последнего изменения, pairs раз в час, optimize по расписанию. Осталось: `clean --keep-days`
+   по расписанию и запуск всех трёх процессов как служб (NSSM/systemd).
 5. **Rate-limit'ы и реальные ордера**: реализация `Executor` с интерфейсом `PaperExchange`
    поверх WS Trade API (`order.create/amend/cancel`, batch до 20 ордеров), учёт лимитов
    Bybit (10 запросов/с на `create` в базовом уровне), приватный стрим `execution`/`order`
