@@ -38,6 +38,10 @@ class Segment:
     def trd_path(self) -> str:
         return os.path.join(self.dir, f"run{self.run_id}_trd.bin")
 
+    @property
+    def ref_path(self) -> str:
+        return os.path.join(self.dir, f"run{self.run_id}_ref.bin")
+
 
 def _day_start(name: str) -> int | None:
     try:
@@ -72,6 +76,14 @@ def load_bbo(seg: Segment, symbols: list[str] | None = None, from_ms: int = 0, t
     return _frame(arr, seg, symbols, from_ms, to_ms, ["bid", "ask", "bid_qty", "ask_qty"], mid=True)
 
 
+def load_ref(seg: Segment, symbols: list[str] | None = None, from_ms: int = 0, to_ms: int = 1 << 62) -> pd.DataFrame:
+    """Reference-venue top of book (same layout as BBO, sizes are zero)."""
+    if not os.path.exists(seg.ref_path):
+        return pd.DataFrame(columns=["ts", "symbol", "bid", "ask", "bid_qty", "ask_qty", "mid"])
+    arr = np.fromfile(seg.ref_path, dtype=BBO_DTYPE)
+    return _frame(arr, seg, symbols, from_ms, to_ms, ["bid", "ask", "bid_qty", "ask_qty"], mid=True)
+
+
 def load_trades(seg: Segment, symbols: list[str] | None = None, from_ms: int = 0, to_ms: int = 1 << 62) -> pd.DataFrame:
     if not os.path.exists(seg.trd_path):
         return pd.DataFrame(columns=["ts", "symbol", "side", "price", "qty"])
@@ -100,6 +112,14 @@ def _frame(arr: np.ndarray, seg: Segment, symbols: list[str] | None, from_ms: in
 def bbo_series(md_dir: str, symbol: str, from_ms: int, to_ms: int) -> pd.DataFrame:
     """Top-of-book series of one symbol across all segments in the period, sorted by ts."""
     parts = [load_bbo(seg, [symbol], from_ms, to_ms) for seg in list_segments(md_dir, from_ms, to_ms)]
+    parts = [p for p in parts if len(p)]
+    if not parts:
+        return pd.DataFrame(columns=["ts", "symbol", "bid", "ask", "bid_qty", "ask_qty", "mid"])
+    return pd.concat(parts, ignore_index=True).sort_values("ts", kind="stable").reset_index(drop=True)
+
+
+def ref_series(md_dir: str, symbol: str, from_ms: int, to_ms: int) -> pd.DataFrame:
+    parts = [load_ref(seg, [symbol], from_ms, to_ms) for seg in list_segments(md_dir, from_ms, to_ms)]
     parts = [p for p in parts if len(p)]
     if not parts:
         return pd.DataFrame(columns=["ts", "symbol", "bid", "ask", "bid_qty", "ask_qty", "mid"])

@@ -14,11 +14,11 @@ import pandas as pd
 from . import db, roundtrips
 
 
-def score_pairs(conn: sqlite3.Connection, lookback_hours: float = 24.0, min_roundtrips: int = 20) -> pd.DataFrame:
+def score_pairs(conn: sqlite3.Connection, lookback_hours: float = 24.0, min_roundtrips: int = 20, max_adverse_markout_bps: float = 3.0, min_markout_samples: int = 20) -> pd.DataFrame:
     since = db.now_ms() - int(lookback_hours * 3.6e6)
     stats = db.read_df(
         conn,
-        "SELECT symbol, spread_med_bps, trades_per_min, vol_bps, turnover_24h, eligible FROM symbol_stats WHERE ts >= ?",
+        "SELECT symbol, ts, spread_med_bps, trades_per_min, vol_bps, turnover_24h, eligible, markout_bps, markout_n FROM symbol_stats WHERE ts >= ?",
         (since,),
     )
     if len(stats) == 0:
@@ -36,6 +36,11 @@ def score_pairs(conn: sqlite3.Connection, lookback_hours: float = 24.0, min_roun
         df["spread_med_bps"] * np.sqrt(df["trades_per_min"].clip(lower=0)) / (1.0 + df["vol_bps"]),
         0.0,
     )
+    # what the core measured after its own fills (latest snapshot per symbol)
+    last = stats.sort_values("ts").groupby("symbol").tail(1)[["symbol", "markout_bps", "markout_n"]]
+    df = df.merge(last, on="symbol", how="left")
+    df["markout_bps"] = df["markout_bps"].fillna(0.0)
+    df["markout_n"] = df["markout_n"].fillna(0).astype(int)
     fills = db.fills(conn, since_ts=since)
     rts = roundtrips.match_roundtrips(fills)
     ps = roundtrips.per_symbol(rts)[["symbol", "n", "net_pnl", "win_rate"]].rename(columns={"n": "n_roundtrips", "net_pnl": "realized_pnl"}) if len(rts) else pd.DataFrame(columns=["symbol", "n_roundtrips", "realized_pnl", "win_rate"])
@@ -47,14 +52,18 @@ def score_pairs(conn: sqlite3.Connection, lookback_hours: float = 24.0, min_roun
     def verdict(r) -> str:
         if r.n_roundtrips >= min_roundtrips and r.realized_pnl < 0 and (r.win_rate or 0) < 0.45:
             return "deny"
+        if max_adverse_markout_bps > 0 and r.markout_n >= min_markout_samples and r.markout_bps < -max_adverse_markout_bps:
+            return "deny"
         if r.score > 0 and r.eligible_share >= 0.3:
             return "good"
         return "neutral"
 
     df["verdict"] = [verdict(r) for r in df.itertuples()]
-    # experience-weighted score: profitable history lifts, losses lower it
+    # experience-weighted score: realized results and markouts beat the quoted spread
     adj = np.where(df["n_roundtrips"] >= min_roundtrips, np.clip(df["realized_pnl"] / 10.0, -0.5, 0.5), 0.0)
-    df["score"] = (df["score"] * (1.0 + adj)).clip(lower=0.0)
+    half = (df["spread_med_bps"] * 0.5).clip(lower=1.0)
+    adj_mo = np.where(df["markout_n"] >= min_markout_samples, np.clip(df["markout_bps"] / half, -0.5, 0.5), 0.0)
+    df["score"] = (df["score"] * (1.0 + adj) * (1.0 + adj_mo)).clip(lower=0.0)
     return df.sort_values("score", ascending=False).reset_index(drop=True)
 
 

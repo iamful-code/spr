@@ -70,6 +70,12 @@ def suggest_params(trial, base: dict) -> dict:
         "stale_exit_mode": trial.suggest_categorical("stale_exit_mode", ["improve", "taker"]),
         "max_vol_bps": trial.suggest_float("max_vol_bps", 10.0, 80.0),
         "toxicity_imbalance": trial.suggest_float("toxicity_imbalance", 0.3, 0.95),
+        "imbalance_weight": trial.suggest_float("imbalance_weight", 0.0, 1.0),
+        "flow_weight": trial.suggest_float("flow_weight", 0.0, 1.0),
+        "ref_weight": trial.suggest_float("ref_weight", 0.0, 2.0),
+        "ref_block_bps": trial.suggest_float("ref_block_bps", 0.0, 15.0),
+        "max_lean_ticks": trial.suggest_int("max_lean_ticks", 0, 10),
+        "stop_loss_bps": trial.suggest_float("stop_loss_bps", 0.0, 40.0),
     }
 
 

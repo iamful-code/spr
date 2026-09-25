@@ -5,7 +5,7 @@
 
 use crate::book::Book;
 use crate::config::{Config, ConfigWatcher, Overrides, StrategyParams, SymbolLists};
-use crate::eligibility::{self, Verdict};
+use crate::eligibility::{self, Experience, Verdict};
 use crate::paper::{PaperExchange, PlaceReq};
 use crate::portfolio::Portfolio;
 use crate::recorder::{BboRec, TrdRec};
@@ -31,8 +31,20 @@ pub struct SymbolState {
     pub quote_reason: &'static str,
     last_rec_bbo_ts: i64,
     last_rec_bbo: Option<Bbo>,
+    last_rec_ref_ts: i64,
     /// realized pnl and fees of the symbol when its current position was opened
     rt_open_marks: Option<(f64, f64)>,
+    /// leading-venue top of book and its provider rank / arrival time
+    pub ref_bbo: Option<Bbo>,
+    ref_ts: i64,
+    ref_rank: u8,
+    /// EWMA of (our mid - reference mid): perps trade at a basis to spot / other venues
+    pub basis: f64,
+    basis_n: u32,
+    pub last_ref_dev_bps: f64,
+    /// online markouts after our own fills
+    pub experience: Experience,
+    pending_markouts: Vec<(i64, f64, f64)>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -128,7 +140,16 @@ impl Engine {
                 quote_reason: "init",
                 last_rec_bbo_ts: 0,
                 last_rec_bbo: None,
+                last_rec_ref_ts: 0,
                 rt_open_marks: None,
+                ref_bbo: None,
+                ref_ts: 0,
+                ref_rank: u8::MAX,
+                basis: 0.0,
+                basis_n: 0,
+                last_ref_dev_bps: 0.0,
+                experience: Experience::default(),
+                pending_markouts: Vec::new(),
                 meta: m,
             });
         }
@@ -246,11 +267,94 @@ impl Engine {
                     }
                 }
             }
+            MarketEvent::Reference { sym, ts, bid, ask, rank } => {
+                let idx = sym as usize;
+                if idx >= self.symbols.len() || !(bid > 0.0 && ask >= bid) {
+                    return;
+                }
+                let stale = self.cfg.reference.stale_ms;
+                let st = &mut self.symbols[idx];
+                // a better provider always wins; a worse one only fills in when the better one is silent
+                if rank <= st.ref_rank || now - st.ref_ts > stale {
+                    st.ref_rank = rank;
+                    st.ref_ts = now;
+                    let rb = Bbo { ts, bid, ask, bid_qty: 0.0, ask_qty: 0.0 };
+                    st.ref_bbo = Some(rb);
+                    if let Some(ours) = st.bbo {
+                        let sample = ours.mid() - rb.mid();
+                        if st.basis_n == 0 {
+                            st.basis = sample;
+                        } else {
+                            let a = self.cfg.reference.basis_alpha;
+                            st.basis += a * (sample - st.basis);
+                        }
+                        st.basis_n += 1;
+                    }
+                    if self.record_md && self.should_record(idx) {
+                        let st = &mut self.symbols[idx];
+                        if now - st.last_rec_ref_ts >= self.cfg.recording.bbo_min_interval_ms {
+                            st.last_rec_ref_ts = now;
+                            self.store.send(StoreMsg::MdRef(BboRec { ts: now, sym, bid, ask, bid_qty: 0.0, ask_qty: 0.0 }));
+                        }
+                    }
+                    // a leading-venue move is exactly when our quotes must be re-checked
+                    self.requote(sym, now);
+                }
+            }
             MarketEvent::Status { conn, msg } => {
                 self.event(now, "info", format!("ws[{conn}]: {msg}"));
             }
         }
         self.maybe_tick(now);
+    }
+
+    /// (reference mid + basis - our mid) / our mid in bps, 0 when the reference is stale or unknown.
+    fn ref_dev_bps(&self, idx: usize, now: i64) -> f64 {
+        let st = &self.symbols[idx];
+        match (st.ref_bbo, st.bbo) {
+            (Some(r), Some(o)) if now - st.ref_ts <= self.cfg.reference.stale_ms && st.basis_n >= 5 => {
+                let fair = r.mid() + st.basis;
+                let m = o.mid();
+                if m > 0.0 {
+                    (fair - m) / m * 1e4
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Resolve the markouts of fills whose horizon has passed and fold them into the EWMA.
+    fn resolve_markouts(&mut self, now: i64) {
+        for st in self.symbols.iter_mut() {
+            if st.pending_markouts.is_empty() {
+                continue;
+            }
+            let Some(bbo) = st.bbo else { continue };
+            let mid = bbo.mid();
+            let mut i = 0;
+            while i < st.pending_markouts.len() {
+                let (due, sign, mid0) = st.pending_markouts[i];
+                if due <= now {
+                    if mid0 > 0.0 && mid > 0.0 {
+                        let mo = sign * (mid - mid0) / mid0 * 1e4;
+                        let e = &mut st.experience;
+                        if e.markout_n == 0 {
+                            e.markout_bps = mo;
+                        } else {
+                            // running mean for the first samples, then an EWMA over ~30 fills
+                            let a = (1.0 / (e.markout_n as f64 + 1.0)).max(1.0 / 30.0);
+                            e.markout_bps += a * (mo - e.markout_bps);
+                        }
+                        e.markout_n += 1;
+                    }
+                    st.pending_markouts.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
     }
 
     /// Advance the clock without a market event (timers in the live loop).
@@ -320,6 +424,8 @@ impl Engine {
             } else if !was_flat && !pos.is_flat() && st.rt_open_marks.is_none() {
                 st.rt_open_marks = Some((pos.realized_pnl - realized, pos.fees - f.fee));
             }
+            let mid0 = if f.bid > 0.0 && f.ask > f.bid { (f.bid + f.ask) * 0.5 } else { f.price };
+            st.pending_markouts.push((f.ts + self.cfg.eligibility.markout_horizon_secs as i64 * 1000, f.side.sign(), mid0));
             tracing::debug!("fill {} {:?} {}@{} fee={:.5} realized={:.5} pos={}", st.meta.name, f.side, f.qty, f.price, f.fee, realized, pos.qty);
             self.store.send(StoreMsg::Fill { symbol: st.meta.name.clone(), realized, fill: f });
             self.store.send(StoreMsg::PositionState {
@@ -361,7 +467,7 @@ impl Engine {
             (st.bbo, st.active, st.params.min_requote_ms)
         };
         let Some(bbo) = bbo else { return };
-        if (!active && flat) || (self.halted && flat) {
+        if flat && (!active || self.halted) {
             // nothing to do here: make sure nothing rests in the book
             if self.symbols[idx].bid_order.is_some() || self.symbols[idx].ask_order.is_some() {
                 self.paper.cancel_all(now, sym);
@@ -373,6 +479,8 @@ impl Engine {
         if now - self.symbols[idx].last_requote_ms < min_requote {
             return;
         }
+        let ref_dev = self.ref_dev_bps(idx, now);
+        self.symbols[idx].last_ref_dev_bps = ref_dev;
         let quotes = {
             let st = &self.symbols[idx];
             let inp = QuoteInput {
@@ -387,6 +495,7 @@ impl Engine {
                 now_ms: now,
                 allow_new_exposure: self.risk.allow_entries && !self.halted,
                 reduce_only: !st.active,
+                ref_dev_bps: ref_dev,
             };
             compute_quotes(&inp)
         };
@@ -429,10 +538,20 @@ impl Engine {
         }
         if let Some(d) = desired {
             let inv = self.portfolio.qty(sym);
-            let id = self.paper.place(
-                now,
-                PlaceReq { sym, side, price: d.price, qty: d.qty, taker: d.taker, purpose: d.purpose, inventory_before: inv, param_version: self.param_version },
-            );
+            let st = &self.symbols[idx];
+            let req = PlaceReq {
+                sym,
+                side,
+                price: d.price,
+                qty: d.qty,
+                taker: d.taker,
+                purpose: d.purpose,
+                inventory_before: inv,
+                param_version: self.param_version,
+                ref_dev_bps: st.last_ref_dev_bps,
+                imbalance: st.bbo.map_or(0.0, |b| b.imbalance()),
+            };
+            let id = self.paper.place(now, req);
             self.set_order_id(idx, side, Some(id));
             self.counters.placed += 1;
         }
@@ -459,10 +578,11 @@ impl Engine {
 
     fn tick(&mut self, now: i64) {
         self.counters.ticks += 1;
+        self.resolve_markouts(now);
         // 1. statistics and eligibility
         for st in self.symbols.iter_mut() {
             st.stats.refresh(now);
-            st.verdict = eligibility::evaluate(&self.cfg.eligibility, &st.meta, &st.stats, &self.lists, st.params.min_spread_bps, now);
+            st.verdict = eligibility::evaluate(&self.cfg.eligibility, &st.meta, &st.stats, &self.lists, st.params.min_spread_bps, now, st.experience);
         }
         // 2. active set
         if now - self.last_refresh_ms >= self.cfg.eligibility.refresh_secs as i64 * 1000 {
@@ -552,6 +672,8 @@ impl Engine {
     fn snapshot_symbols(&self, now: i64) {
         for (i, st) in self.symbols.iter().enumerate() {
             let Some(bbo) = st.bbo else { continue };
+            // computed here rather than taken from the last requote, so inactive symbols show it too
+            let ref_dev = self.ref_dev_bps(i, now);
             self.store.send(StoreMsg::SymbolStats(SymbolStatsRow {
                 ts: now,
                 symbol: st.meta.name.clone(),
@@ -568,6 +690,9 @@ impl Engine {
                 ask: bbo.ask,
                 position_qty: self.portfolio.qty(i as SymbolId),
                 quote_reason: st.quote_reason,
+                markout_bps: st.experience.markout_bps,
+                markout_n: st.experience.markout_n,
+                ref_dev_bps: ref_dev,
             }));
         }
     }

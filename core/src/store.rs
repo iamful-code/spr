@@ -26,6 +26,7 @@ pub enum StoreMsg {
     ParamVersion { version: u32, ts: i64, params_json: String },
     MdBbo(BboRec),
     MdTrade(TrdRec),
+    MdRef(BboRec),
     Shutdown,
 }
 
@@ -46,6 +47,9 @@ pub struct SymbolStatsRow {
     pub ask: f64,
     pub position_qty: f64,
     pub quote_reason: &'static str,
+    pub markout_bps: f64,
+    pub markout_n: u32,
+    pub ref_dev_bps: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -136,7 +140,9 @@ CREATE TABLE IF NOT EXISTS fills (
     queue_ahead_initial REAL,
     inventory_before REAL,
     param_version INTEGER,
-    realized_pnl REAL
+    realized_pnl REAL,
+    ref_dev_bps REAL,
+    imbalance REAL
 );
 CREATE INDEX IF NOT EXISTS fills_run_sym_ts ON fills(run_id, symbol, ts);
 CREATE INDEX IF NOT EXISTS fills_ts ON fills(ts);
@@ -166,7 +172,8 @@ CREATE TABLE IF NOT EXISTS symbol_stats (
     spread_med_bps REAL, spread_mean_bps REAL, vol_bps REAL, trades_per_min REAL,
     turnover_24h REAL,
     eligible INTEGER, reason TEXT, score REAL, active INTEGER,
-    bid REAL, ask REAL, position_qty REAL, quote_reason TEXT
+    bid REAL, ask REAL, position_qty REAL, quote_reason TEXT,
+    markout_bps REAL, markout_n INTEGER, ref_dev_bps REAL
 );
 CREATE INDEX IF NOT EXISTS symbol_stats_ts ON symbol_stats(run_id, ts);
 CREATE INDEX IF NOT EXISTS symbol_stats_sym ON symbol_stats(symbol, ts);
@@ -247,7 +254,29 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 30_000)?;
     conn.execute_batch(SCHEMA)?;
+    migrate(&conn)?;
     Ok(conn)
+}
+
+/// Columns added after the first release; databases created earlier get them here.
+const MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("fills", "ref_dev_bps", "REAL"),
+    ("fills", "imbalance", "REAL"),
+    ("symbol_stats", "markout_bps", "REAL"),
+    ("symbol_stats", "markout_n", "INTEGER"),
+    ("symbol_stats", "ref_dev_bps", "REAL"),
+];
+
+fn migrate(conn: &Connection) -> Result<()> {
+    for (table, column, ty) in MIGRATIONS {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let cols: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(1))?.filter_map(|c| c.ok()).collect();
+        if !cols.iter().any(|c| c == column) {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
+            tracing::info!("database migrated: {table}.{column}");
+        }
+    }
+    Ok(())
 }
 
 /// Start the writer thread. `record_md = false` disables the binary recorder.
@@ -297,6 +326,7 @@ fn writer_loop(mut conn: Connection, mut recorder: Option<Recorder>, run_id: i64
                 let r = match m {
                     StoreMsg::MdBbo(b) => rec.write_bbo(b),
                     StoreMsg::MdTrade(t) => rec.write_trade(t),
+                    StoreMsg::MdRef(b) => rec.write_ref(b),
                     _ => Ok(()),
                 };
                 if let Err(e) = r {
@@ -315,7 +345,7 @@ fn writer_loop(mut conn: Connection, mut recorder: Option<Recorder>, run_id: i64
         // 2. Database rows in one transaction, retried on transient errors such as
         //    SQLITE_BUSY while the analytics side is writing. The thread never exits
         //    because of a write error: at worst one batch is dropped and logged.
-        let n_rows = batch.iter().filter(|m| !matches!(m, StoreMsg::MdBbo(_) | StoreMsg::MdTrade(_) | StoreMsg::Shutdown)).count();
+        let n_rows = batch.iter().filter(|m| !matches!(m, StoreMsg::MdBbo(_) | StoreMsg::MdTrade(_) | StoreMsg::MdRef(_) | StoreMsg::Shutdown)).count();
         if n_rows > 0 {
             let mut attempt = 0u32;
             loop {
@@ -352,7 +382,7 @@ fn write_batch(conn: &mut Connection, run_id: i64, batch: &[StoreMsg]) -> Result
     let tx = conn.transaction()?;
     for m in batch {
         match m {
-            StoreMsg::MdBbo(_) | StoreMsg::MdTrade(_) | StoreMsg::Shutdown => {}
+            StoreMsg::MdBbo(_) | StoreMsg::MdTrade(_) | StoreMsg::MdRef(_) | StoreMsg::Shutdown => {}
             other => write_row(&tx, run_id, other)?,
         }
     }
@@ -371,8 +401,8 @@ fn write_row(tx: &rusqlite::Transaction, run_id: i64, m: &StoreMsg) -> Result<()
         }
         StoreMsg::Fill { fill: f, symbol, realized } => {
             tx.prepare_cached(
-                "INSERT INTO fills(run_id, order_id, symbol, side, price, qty, fee, ts, is_maker, purpose, bid, ask, placed_ts, mid_at_place, spread_bps_at_place, queue_ahead_initial, inventory_before, param_version, realized_pnl) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                "INSERT INTO fills(run_id, order_id, symbol, side, price, qty, fee, ts, is_maker, purpose, bid, ask, placed_ts, mid_at_place, spread_bps_at_place, queue_ahead_initial, inventory_before, param_version, realized_pnl, ref_dev_bps, imbalance) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             )?
             .execute(params![
                 run_id,
@@ -393,7 +423,9 @@ fn write_row(tx: &rusqlite::Transaction, run_id: i64, m: &StoreMsg) -> Result<()
                 f.queue_ahead_initial,
                 f.inventory_before,
                 f.param_version as i64,
-                realized
+                realized,
+                f.ref_dev_bps,
+                f.imbalance
             ])?;
         }
         StoreMsg::OrderDone { done: o, symbol } => {
@@ -426,8 +458,8 @@ fn write_row(tx: &rusqlite::Transaction, run_id: i64, m: &StoreMsg) -> Result<()
         }
         StoreMsg::SymbolStats(s) => {
             tx.prepare_cached(
-                "INSERT INTO symbol_stats(run_id, ts, symbol, spread_med_bps, spread_mean_bps, vol_bps, trades_per_min, turnover_24h, eligible, reason, score, active, bid, ask, position_qty, quote_reason) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                "INSERT INTO symbol_stats(run_id, ts, symbol, spread_med_bps, spread_mean_bps, vol_bps, trades_per_min, turnover_24h, eligible, reason, score, active, bid, ask, position_qty, quote_reason, markout_bps, markout_n, ref_dev_bps) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             )?
             .execute(params![
                 run_id,
@@ -445,7 +477,10 @@ fn write_row(tx: &rusqlite::Transaction, run_id: i64, m: &StoreMsg) -> Result<()
                 s.bid,
                 s.ask,
                 s.position_qty,
-                s.quote_reason
+                s.quote_reason,
+                s.markout_bps,
+                s.markout_n as i64,
+                s.ref_dev_bps
             ])?;
         }
         StoreMsg::Pnl(p) => {
@@ -477,7 +512,7 @@ fn write_row(tx: &rusqlite::Transaction, run_id: i64, m: &StoreMsg) -> Result<()
             tx.prepare_cached("INSERT OR REPLACE INTO param_versions(run_id, version, ts, params_json) VALUES (?1, ?2, ?3, ?4)")?
                 .execute(params![run_id, *version as i64, ts, params_json])?;
         }
-        StoreMsg::Shutdown | StoreMsg::MdBbo(_) | StoreMsg::MdTrade(_) => {}
+        StoreMsg::Shutdown | StoreMsg::MdBbo(_) | StoreMsg::MdTrade(_) | StoreMsg::MdRef(_) => {}
     }
     Ok(())
 }
@@ -513,6 +548,8 @@ mod tests {
             queue_ahead_initial: 3.0,
             inventory_before: 0.0,
             param_version: 1,
+            ref_dev_bps: 0.0,
+            imbalance: 0.0,
         };
         store.handle.send(StoreMsg::Fill { fill: f, symbol: "AUSDT".into(), realized: 0.0 });
         store.handle.send(StoreMsg::Event { ts: 6, level: "info", msg: "hello".into() });

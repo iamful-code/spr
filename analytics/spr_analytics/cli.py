@@ -57,6 +57,11 @@ def cmd_analyze(a) -> int:
         if len(res["markouts"]):
             print("\nmarkouts after entries (bps, negative = adverse selection):")
             print(res["markouts"].to_string(index=False))
+        for key, title in (("by_queue", "by queue position (queue ahead / order size)"), ("by_side", "by side"), ("by_ref", "by reference signal at placement"), ("by_hour", "by hour (UTC)")):
+            tbl = res.get("breakdowns", {}).get(key)
+            if tbl is not None and len(tbl):
+                print(f"\nmarkouts {title}:")
+                print(tbl.to_string(index=False))
     recs = res["recommendations"]
     n = db.write_recommendations(conn, run_id, recs)
     print(f"\n{n} recommendations written")

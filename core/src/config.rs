@@ -87,6 +87,7 @@ fn d_equity() -> f64 {
 /// The tunable part of the strategy. This is what the optimizer searches over and
 /// what per-symbol overrides can replace field by field.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StrategyParams {
     pub min_spread_bps: f64,
     pub min_edge_bps: f64,
@@ -101,6 +102,21 @@ pub struct StrategyParams {
     pub max_vol_bps: f64,
     pub toxicity_imbalance: f64,
     pub toxicity_window_secs: u32,
+    /// Fair-value model: how much of the half spread the top-of-book size imbalance shifts
+    /// the fair price (0 = ignore the book).
+    pub imbalance_weight: f64,
+    /// Same for the taker-flow imbalance over `toxicity_window_secs`.
+    pub flow_weight: f64,
+    /// Share of the reference-venue deviation (reference mid + basis - our mid) added to fair value.
+    pub ref_weight: f64,
+    /// Block a side outright when the reference says the price is already this many bps away (0 = off).
+    pub ref_block_bps: f64,
+    /// Give up a side when fair value pushes its quote deeper than this many ticks behind the best level.
+    pub max_lean_ticks: i64,
+    /// Exit at once when the mid moved this many bps against the position (0 = off).
+    pub stop_loss_bps: f64,
+    /// "taker" (cross the spread) or "improve" (one tick inside) for stop-loss exits.
+    pub stop_loss_mode: String,
 }
 
 impl Default for StrategyParams {
@@ -119,6 +135,13 @@ impl Default for StrategyParams {
             max_vol_bps: 25.0,
             toxicity_imbalance: 0.6,
             toxicity_window_secs: 10,
+            imbalance_weight: 0.5,
+            flow_weight: 0.3,
+            ref_weight: 1.0,
+            ref_block_bps: 4.0,
+            max_lean_ticks: 3,
+            stop_loss_bps: 12.0,
+            stop_loss_mode: "taker".into(),
         }
     }
 }
@@ -146,6 +169,13 @@ impl StrategyParams {
         anyhow::ensure!(self.quote_mode == "join" || self.quote_mode == "improve", "quote_mode must be join|improve");
         anyhow::ensure!(self.stale_exit_mode == "improve" || self.stale_exit_mode == "taker", "stale_exit_mode must be improve|taker");
         anyhow::ensure!(self.toxicity_window_secs >= 1 && self.toxicity_window_secs <= 300, "toxicity_window_secs in 1..300");
+        anyhow::ensure!((0.0..=1.0).contains(&self.imbalance_weight), "imbalance_weight in 0..1");
+        anyhow::ensure!((0.0..=1.0).contains(&self.flow_weight), "flow_weight in 0..1");
+        anyhow::ensure!((0.0..=2.0).contains(&self.ref_weight), "ref_weight in 0..2");
+        anyhow::ensure!(self.ref_block_bps >= 0.0, "ref_block_bps must be >= 0");
+        anyhow::ensure!(self.max_lean_ticks >= 0, "max_lean_ticks must be >= 0");
+        anyhow::ensure!(self.stop_loss_bps >= 0.0, "stop_loss_bps must be >= 0");
+        anyhow::ensure!(self.stop_loss_mode == "taker" || self.stop_loss_mode == "improve", "stop_loss_mode must be taker|improve");
         Ok(())
     }
 }
@@ -170,6 +200,23 @@ pub struct EligibilityCfg {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Horizon for the online markout the core measures after its own entries, seconds.
+    #[serde(default = "d_markout_h")]
+    pub markout_horizon_secs: u32,
+    /// Exclude a symbol whose average entry markout is worse than this (bps, 0 = off).
+    #[serde(default = "d_max_adverse")]
+    pub max_adverse_markout_bps: f64,
+    #[serde(default = "d_min_markout_n")]
+    pub min_markout_samples: u32,
+}
+fn d_markout_h() -> u32 {
+    5
+}
+fn d_max_adverse() -> f64 {
+    3.0
+}
+fn d_min_markout_n() -> u32 {
+    20
 }
 fn d_min_turnover() -> f64 {
     2_000_000.0
@@ -191,6 +238,38 @@ fn d_max_active() -> usize {
 }
 fn d_refresh() -> u64 {
     15
+}
+
+/// Leading-venue price feeds. A cheap perp on Bybit follows the same coin on a liquid
+/// venue with a lag; the deviation of (reference mid + basis) from our mid is the
+/// strongest short-term signal we have.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReferenceCfg {
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    /// In priority order: "binance_futures", "binance_spot", "bybit_spot".
+    #[serde(default = "d_ref_providers")]
+    pub providers: Vec<String>,
+    /// A reference quote older than this is ignored, ms.
+    #[serde(default = "d_ref_stale")]
+    pub stale_ms: i64,
+    #[serde(default = "d_ref_per_conn")]
+    pub symbols_per_connection: usize,
+    /// EWMA factor for the basis (our mid - reference mid), per reference update.
+    #[serde(default = "d_basis_alpha")]
+    pub basis_alpha: f64,
+}
+fn d_ref_providers() -> Vec<String> {
+    vec!["binance_futures".into(), "bybit_spot".into()]
+}
+fn d_ref_stale() -> i64 {
+    3000
+}
+fn d_ref_per_conn() -> usize {
+    100
+}
+fn d_basis_alpha() -> f64 {
+    0.02
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -267,6 +346,8 @@ pub struct Config {
     pub strategy: StrategyParams,
     #[serde(default = "default_elig")]
     pub eligibility: EligibilityCfg,
+    #[serde(default = "default_reference")]
+    pub reference: ReferenceCfg,
     #[serde(default = "default_risk")]
     pub risk: RiskCfg,
     #[serde(default = "default_rec")]
@@ -285,6 +366,9 @@ fn default_paper() -> PaperCfg {
     toml::from_str("").unwrap()
 }
 fn default_elig() -> EligibilityCfg {
+    toml::from_str("").unwrap()
+}
+fn default_reference() -> ReferenceCfg {
     toml::from_str("").unwrap()
 }
 fn default_risk() -> RiskCfg {

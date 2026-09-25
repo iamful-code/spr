@@ -59,12 +59,22 @@ struct TradeData<'a> {
     p: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FeedMode {
+    /// Our trading venue: full book updates and trades.
+    Primary,
+    /// A leading venue: only the top of book, delivered as `MarketEvent::Reference`.
+    Reference { rank: u8 },
+}
+
 struct ConnSpec {
     idx: usize,
+    label: String,
     url: String,
     depth: u32,
     args_per_subscribe: usize,
     symbols: Vec<(String, SymbolId)>,
+    mode: FeedMode,
 }
 
 /// Spawn one task per connection. Returns the join handles (they run until aborted).
@@ -74,15 +84,73 @@ pub fn spawn_connections(cfg: &ExchangeCfg, symbols: &[SymbolMeta], tx: mpsc::Se
     for (idx, chunk) in symbols.chunks(per_conn).enumerate() {
         let spec = ConnSpec {
             idx,
+            label: "ws".into(),
             url: cfg.ws_url.clone(),
             depth: cfg.orderbook_depth.max(1),
             args_per_subscribe: cfg.args_per_subscribe.max(1),
             symbols: chunk.iter().map(|m| (m.name.clone(), m.id)).collect(),
+            mode: FeedMode::Primary,
         };
         let tx = tx.clone();
         handles.push(tokio::spawn(connection_loop(spec, tx)));
     }
     handles
+}
+
+/// Bybit spot (or any other Bybit public stream) as a reference venue. Subscriptions go
+/// one topic per request so a symbol that does not exist there does not sink the batch.
+pub fn spawn_reference_connections(url: &str, label: &str, symbols: &[SymbolMeta], rank: u8, per_conn: usize, tx: mpsc::Sender<MarketEvent>) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut handles = Vec::new();
+    for (idx, chunk) in symbols.chunks(per_conn.max(1)).enumerate() {
+        let spec = ConnSpec {
+            idx,
+            label: label.to_string(),
+            url: url.to_string(),
+            depth: 1,
+            args_per_subscribe: 1,
+            symbols: chunk.iter().map(|m| (m.name.clone(), m.id)).collect(),
+            mode: FeedMode::Reference { rank },
+        };
+        let tx = tx.clone();
+        handles.push(tokio::spawn(connection_loop(spec, tx)));
+    }
+    handles
+}
+
+/// Depth-1 book kept per reference symbol: Bybit sends the top level as snapshot/delta
+/// like any other depth, so deletions must be applied before reading the best price.
+#[derive(Default)]
+struct MiniBook {
+    bids: HashMap<String, f64>,
+    asks: HashMap<String, f64>,
+}
+
+impl MiniBook {
+    fn apply(&mut self, snapshot: bool, bids: &[[&str; 2]], asks: &[[&str; 2]]) {
+        if snapshot {
+            self.bids.clear();
+            self.asks.clear();
+        }
+        for (side, levels) in [(&mut self.bids, bids), (&mut self.asks, asks)] {
+            for [p, q] in levels {
+                let qty: f64 = q.parse().unwrap_or(0.0);
+                if qty <= 0.0 {
+                    side.remove(*p);
+                } else {
+                    side.insert((*p).to_string(), qty);
+                }
+            }
+        }
+    }
+    fn best(&self) -> Option<(f64, f64)> {
+        let bid = self.bids.keys().filter_map(|p| p.parse::<f64>().ok()).fold(f64::NAN, f64::max);
+        let ask = self.asks.keys().filter_map(|p| p.parse::<f64>().ok()).fold(f64::NAN, f64::min);
+        if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask >= bid {
+            Some((bid, ask))
+        } else {
+            None
+        }
+    }
 }
 
 async fn connection_loop(spec: ConnSpec, tx: mpsc::Sender<MarketEvent>) {
@@ -93,7 +161,7 @@ async fn connection_loop(spec: ConnSpec, tx: mpsc::Sender<MarketEvent>) {
         match run_connection(&spec, &tx).await {
             Ok(()) => {}
             Err(e) => {
-                let _ = tx.send(MarketEvent::Status { conn: spec.idx, msg: format!("disconnected: {e:#}; reconnect in {backoff}s") }).await;
+                let _ = tx.send(MarketEvent::Status { conn: spec.idx, msg: format!("{}: disconnected: {e:#}; reconnect in {backoff}s", spec.label) }).await;
             }
         }
         if tx.is_closed() {
@@ -116,13 +184,16 @@ async fn run_connection(spec: &ConnSpec, tx: &mpsc::Sender<MarketEvent>) -> Resu
     let mut topics: Vec<String> = Vec::with_capacity(spec.symbols.len() * 2);
     for (name, _) in &spec.symbols {
         topics.push(format!("orderbook.{}.{}", spec.depth, name));
-        topics.push(format!("publicTrade.{}", name));
+        if spec.mode == FeedMode::Primary {
+            topics.push(format!("publicTrade.{}", name));
+        }
     }
     for (i, chunk) in topics.chunks(spec.args_per_subscribe).enumerate() {
         let msg = serde_json::json!({ "op": "subscribe", "req_id": format!("c{}-{}", spec.idx, i), "args": chunk });
         sink.send(Message::Text(msg.to_string())).await.context("sending subscribe")?;
     }
-    tx.send(MarketEvent::Status { conn: spec.idx, msg: format!("connected, {} symbols, {} topics", spec.symbols.len(), topics.len()) }).await.ok();
+    tx.send(MarketEvent::Status { conn: spec.idx, msg: format!("{}: connected, {} symbols, {} topics", spec.label, spec.symbols.len(), topics.len()) }).await.ok();
+    let mut books: HashMap<SymbolId, MiniBook> = HashMap::new();
 
     let mut ping = tokio::time::interval(Duration::from_secs(20));
     ping.tick().await; // first tick fires immediately; skip it
@@ -148,7 +219,7 @@ async fn run_connection(spec: &ConnSpec, tx: &mpsc::Sender<MarketEvent>) -> Resu
                 last_msg = std::time::Instant::now();
                 match msg {
                     Message::Text(txt) => {
-                        if let Err(e) = handle_text(&txt, &by_name, tx, &mut n_sub_ok, spec.idx).await {
+                        if let Err(e) = handle_text(&txt, &by_name, tx, &mut n_sub_ok, spec.idx, spec.mode, &mut books).await {
                             tracing::debug!("ws[{}] bad message: {e:#}: {}", spec.idx, txt.chars().take(200).collect::<String>());
                         }
                     }
@@ -161,13 +232,18 @@ async fn run_connection(spec: &ConnSpec, tx: &mpsc::Sender<MarketEvent>) -> Resu
     }
 }
 
-async fn handle_text(txt: &str, by_name: &HashMap<&str, SymbolId>, tx: &mpsc::Sender<MarketEvent>, n_sub_ok: &mut usize, conn: usize) -> Result<()> {
+async fn handle_text(txt: &str, by_name: &HashMap<&str, SymbolId>, tx: &mpsc::Sender<MarketEvent>, n_sub_ok: &mut usize, conn: usize, mode: FeedMode, books: &mut HashMap<SymbolId, MiniBook>) -> Result<()> {
     let env: Envelope = serde_json::from_str(txt).context("envelope")?;
     if let Some(op) = env.op {
         match op {
             "subscribe" => {
                 if env.success == Some(false) {
-                    tx.send(MarketEvent::Status { conn, msg: format!("subscribe failed: {}", env.ret_msg.unwrap_or("")) }).await.ok();
+                    // reference feeds subscribe one symbol at a time: a missing spot pair is expected
+                    if mode == FeedMode::Primary {
+                        tx.send(MarketEvent::Status { conn, msg: format!("subscribe failed: {}", env.ret_msg.unwrap_or("")) }).await.ok();
+                    } else {
+                        tracing::debug!("reference subscribe failed: {}", env.ret_msg.unwrap_or(""));
+                    }
                 } else {
                     *n_sub_ok += 1;
                 }
@@ -182,6 +258,14 @@ async fn handle_text(txt: &str, by_name: &HashMap<&str, SymbolId>, tx: &mpsc::Se
         let d: BookData = serde_json::from_str(data.get()).context("orderbook data")?;
         let Some(&sym) = by_name.get(d.s) else { return Ok(()) };
         let snapshot = env.typ == Some("snapshot") || d.u == Some(1);
+        if let FeedMode::Reference { rank } = mode {
+            let book = books.entry(sym).or_default();
+            book.apply(snapshot, &d.b, &d.a);
+            if let Some((bid, ask)) = book.best() {
+                tx.send(MarketEvent::Reference { sym, ts: env.ts.unwrap_or(0), bid, ask, rank }).await.ok();
+            }
+            return Ok(());
+        }
         let parse = |v: &[[&str; 2]]| -> Vec<(f64, f64)> { v.iter().filter_map(|[p, q]| Some((p.parse::<f64>().ok()?, q.parse::<f64>().ok()?))).collect() };
         let ev = MarketEvent::Book { sym, ts: env.ts.unwrap_or(0), snapshot, bids: parse(&d.b), asks: parse(&d.a) };
         tx.send(ev).await.ok();
@@ -212,8 +296,9 @@ mod tests {
         let mut by_name = HashMap::new();
         by_name.insert("BTCUSDT", 3u32);
         let mut n = 0;
+        let mut books = HashMap::new();
         let book = r#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1700000000000,"data":{"s":"BTCUSDT","b":[["84228.9","1.25"]],"a":[["84229.0","0.5"]],"u":1,"seq":123},"cts":1699999999999}"#;
-        handle_text(book, &by_name, &tx, &mut n, 0).await.unwrap();
+        handle_text(book, &by_name, &tx, &mut n, 0, FeedMode::Primary, &mut books).await.unwrap();
         match rx.recv().await.unwrap() {
             MarketEvent::Book { sym, snapshot, bids, asks, .. } => {
                 assert_eq!(sym, 3);
@@ -224,7 +309,7 @@ mod tests {
             _ => panic!("expected book"),
         }
         let trade = r#"{"topic":"publicTrade.BTCUSDT","type":"snapshot","ts":1700000000001,"data":[{"T":1700000000000,"s":"BTCUSDT","S":"Sell","v":"0.002","p":"84228.9","L":"MinusTick","i":"abc","BT":false}]}"#;
-        handle_text(trade, &by_name, &tx, &mut n, 0).await.unwrap();
+        handle_text(trade, &by_name, &tx, &mut n, 0, FeedMode::Primary, &mut books).await.unwrap();
         match rx.recv().await.unwrap() {
             MarketEvent::Trades { sym, trades } => {
                 assert_eq!(sym, 3);
@@ -235,13 +320,38 @@ mod tests {
             _ => panic!("expected trades"),
         }
         let sub = r#"{"success":true,"ret_msg":"subscribe","conn_id":"x","op":"subscribe"}"#;
-        handle_text(sub, &by_name, &tx, &mut n, 0).await.unwrap();
+        handle_text(sub, &by_name, &tx, &mut n, 0, FeedMode::Primary, &mut books).await.unwrap();
         assert_eq!(n, 1);
         let pong = r#"{"success":true,"ret_msg":"pong","conn_id":"x","op":"ping"}"#;
-        handle_text(pong, &by_name, &tx, &mut n, 0).await.unwrap();
+        handle_text(pong, &by_name, &tx, &mut n, 0, FeedMode::Primary, &mut books).await.unwrap();
         // unknown symbol is ignored
         let other = r#"{"topic":"orderbook.1.ETHUSDT","type":"delta","ts":1,"data":{"s":"ETHUSDT","b":[],"a":[["1","1"]],"u":5,"seq":1}}"#;
-        handle_text(other, &by_name, &tx, &mut n, 0).await.unwrap();
+        handle_text(other, &by_name, &tx, &mut n, 0, FeedMode::Primary, &mut books).await.unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reference_mode_emits_top_of_book() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut by_name = HashMap::new();
+        by_name.insert("BTCUSDT", 1u32);
+        let mut n = 0;
+        let mut books = HashMap::new();
+        let mode = FeedMode::Reference { rank: 2 };
+        let snap = r#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":10,"data":{"s":"BTCUSDT","b":[["100.0","1"]],"a":[["100.2","1"]],"u":7,"seq":1}}"#;
+        handle_text(snap, &by_name, &tx, &mut n, 0, mode, &mut books).await.unwrap();
+        match rx.recv().await.unwrap() {
+            MarketEvent::Reference { sym, bid, ask, rank, .. } => {
+                assert_eq!((sym, bid, ask, rank), (1, 100.0, 100.2, 2));
+            }
+            _ => panic!("expected reference"),
+        }
+        // delta: the old ask is deleted and a better one appears
+        let delta = r#"{"topic":"orderbook.1.BTCUSDT","type":"delta","ts":11,"data":{"s":"BTCUSDT","b":[],"a":[["100.2","0"],["100.1","3"]],"u":8,"seq":2}}"#;
+        handle_text(delta, &by_name, &tx, &mut n, 0, mode, &mut books).await.unwrap();
+        match rx.recv().await.unwrap() {
+            MarketEvent::Reference { ask, .. } => assert_eq!(ask, 100.1),
+            _ => panic!("expected reference"),
+        }
     }
 }

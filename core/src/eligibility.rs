@@ -21,7 +21,15 @@ pub fn score(spread_med_bps: f64, trades_per_min: f64, vol_bps: f64) -> f64 {
     spread_med_bps * trades_per_min.sqrt() / (1.0 + vol_bps)
 }
 
-pub fn evaluate(cfg: &EligibilityCfg, meta: &SymbolMeta, stats: &SymbolStats, lists: &SymbolLists, min_spread_bps: f64, now_ms: i64) -> Verdict {
+/// What the core has measured about its own fills on this symbol so far.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Experience {
+    /// EWMA of the markout after our fills (bps, negative = adverse selection).
+    pub markout_bps: f64,
+    pub markout_n: u32,
+}
+
+pub fn evaluate(cfg: &EligibilityCfg, meta: &SymbolMeta, stats: &SymbolStats, lists: &SymbolLists, min_spread_bps: f64, now_ms: i64, exp: Experience) -> Verdict {
     let no = |reason: &'static str| Verdict { eligible: false, reason, score: 0.0 };
     if cfg.deny.iter().any(|s| s == &meta.name) || lists.deny.iter().any(|s| s == &meta.name) {
         return no("denied");
@@ -53,10 +61,20 @@ pub fn evaluate(cfg: &EligibilityCfg, meta: &SymbolMeta, stats: &SymbolStats, li
     if stats.vol_bps > 0.0 && cfg.min_spread_vol_ratio > 0.0 && stats.spread_med_bps / stats.vol_bps < cfg.min_spread_vol_ratio {
         return no("vol_high");
     }
+    let experienced = cfg.min_markout_samples > 0 && exp.markout_n >= cfg.min_markout_samples;
+    if experienced && cfg.max_adverse_markout_bps > 0.0 && exp.markout_bps < -cfg.max_adverse_markout_bps {
+        return no("toxic_flow");
+    }
     let online = score(stats.spread_med_bps, stats.trades_per_min, stats.vol_bps);
-    let s = match lists.scores.get(&meta.name) {
+    let mut s = match lists.scores.get(&meta.name) {
         Some(off) if *off > 0.0 => 0.5 * (online + *off),
         _ => online,
     };
+    if experienced {
+        // realized experience beats the quoted spread: a symbol that pays us after fills
+        // ranks higher, one that runs over us ranks lower
+        let half = (stats.spread_med_bps * 0.5).max(1.0);
+        s *= 1.0 + (exp.markout_bps / half).clamp(-0.5, 0.5);
+    }
     Verdict { eligible: true, reason: "ok", score: s }
 }

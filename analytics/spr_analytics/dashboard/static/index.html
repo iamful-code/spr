@@ -98,6 +98,15 @@
   <section class="tab" id="tab-recs">
     <div class="panel"><h2>Открытые рекомендации <span class="muted">(python -m spr_analytics analyze [--apply])</span></h2><div id="recs"></div></div>
     <div class="panel"><h2>Скоринг пар <span class="muted">(python -m spr_analytics pairs)</span></h2><div class="scroll" id="pairs"></div></div>
+    <div class="panel"><h2>Markout после входов, bps <span class="muted">(отрицательный = нас переехал информированный поток; mid через 1/5/30/60 с)</span></h2>
+      <div class="grid2">
+        <div><h2>По символам</h2><div class="scroll" id="mo_symbol"></div></div>
+        <div><h2>По позиции в очереди (очередь впереди / размер ордера)</h2><div id="mo_queue"></div>
+             <h2 style="margin-top:12px">По сигналу референса при выставлении</h2><div id="mo_ref"></div>
+             <h2 style="margin-top:12px">По стороне</h2><div id="mo_side"></div></div>
+      </div>
+      <h2 style="margin-top:12px">По часам (UTC)</h2><div id="mo_hour"></div>
+    </div>
   </section>
 
   <section class="tab" id="tab-opt">
@@ -173,6 +182,8 @@ async function refresh() {
         { k: "reason", t: "фильтр" }, { k: "quote_reason", t: "котировка" }, { k: "score", t: "score", f: v => fmt(v, 1) },
         { k: "spread_med_bps", t: "спред мед., bps", f: v => fmt(v, 2) }, { k: "vol_bps", t: "вола, bps/мин", f: v => fmt(v, 1) },
         { k: "trades_per_min", t: "сделок/мин", f: v => fmt(v, 1) }, { k: "turnover_24h", t: "оборот 24ч", f: v => fmt(v / 1e6, 1) + "M" },
+        { k: "markout_bps", t: "markout, bps", f: (v, r) => r.markout_n ? `${fmt(v, 2)} <span class="muted">(${r.markout_n})</span>` : "–", c: cls },
+        { k: "ref_dev_bps", t: "референс, bps", f: v => fmt(v, 2), c: cls },
         { k: "bid", t: "bid", f: v => v }, { k: "ask", t: "ask", f: v => v },
         { k: "position_qty", t: "позиция", f: v => fmt(v, 3), c: cls }, { k: "unrealized", t: "нереализ.", f: v => fmt(v), c: cls },
         { k: "net", t: "чистый", f: v => fmt(v), c: cls }, { k: "n_fills", t: "исполн." },
@@ -191,7 +202,13 @@ async function refresh() {
         { k: "queue_ahead_initial", t: "очередь", f: v => fmt(v, 2) }, { k: "is_maker", t: "мейкер", f: v => v ? "да" : "нет" },
       ], "fills");
     } else if (state.tab === "recs") {
-      const [recs, pairs] = await Promise.all([api("/api/recommendations"), api("/api/pair_scores")]);
+      const [recs, pairs, mo] = await Promise.all([api("/api/recommendations"), api("/api/pair_scores"), api("/api/markouts" + q)]);
+      const moCols = (first) => [first, { k: "n", t: "n" }, { k: "mo_1s", t: "1 с", f: v => fmt(v, 2), c: cls }, { k: "mo_5s", t: "5 с", f: v => fmt(v, 2), c: cls }, { k: "mo_30s", t: "30 с", f: v => fmt(v, 2), c: cls }, { k: "mo_60s", t: "60 с", f: v => fmt(v, 2), c: cls }, { k: "half_spread_bps", t: "полуспред", f: v => fmt(v, 2) }];
+      table($("#mo_symbol"), mo.by_symbol, moCols({ k: "symbol", t: "символ" }), "mo_symbol");
+      table($("#mo_queue"), mo.by_queue, moCols({ k: "queue_bucket", t: "очередь" }), "mo_queue");
+      table($("#mo_ref"), mo.by_ref, moCols({ k: "ref_signal", t: "референс" }), "mo_ref");
+      table($("#mo_side"), mo.by_side, moCols({ k: "side", t: "сторона" }), "mo_side");
+      table($("#mo_hour"), mo.by_hour, moCols({ k: "hour_utc", t: "час UTC" }), "mo_hour");
       $("#recs").innerHTML = recs.length ? recs.map(r => `<div class="rec"><span class="badge ${r.severity}">${r.severity}</span> <b>${r.rule}</b> <span class="muted">${r.symbol || "все символы"} · ${ts(r.created_ts)}</span><div class="m">${r.message}</div>${r.param ? `<div><code>${r.param}: ${r.current_value ?? ""} → ${r.suggested_value ?? ""}</code></div>` : ""}<details><summary>данные</summary><pre>${r.evidence_json || ""}</pre></details></div>`).join("") : `<div class="muted">Пока нет. Запустите <code>python -m spr_analytics analyze</code>.</div>`;
       table($("#pairs"), pairs, [
         { k: "symbol", t: "символ" }, { k: "verdict", t: "вердикт" }, { k: "score", t: "score", f: v => fmt(v, 2) }, { k: "spread_med_bps", t: "спред, bps", f: v => fmt(v, 2) },

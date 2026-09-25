@@ -189,6 +189,8 @@ mod tests {
             queue_ahead_initial: 0.0,
             inventory_before: 0.0,
             param_version: 1,
+            ref_dev_bps: 0.0,
+            imbalance: 0.0,
         }
     }
 

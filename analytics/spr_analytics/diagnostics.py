@@ -16,6 +16,7 @@ import pandas as pd
 from . import db, markouts, roundtrips
 
 RULES_DOC = {
+    "back_of_queue": "Исполнения из хвоста очереди токсичны, а из головы — нет: нужен приоритет в очереди",
     "adverse_selection": "Markout через 5 с после входа хуже, чем −0.5 × полуспреда: нас переезжает информированный поток",
     "low_fill_ratio": "Мало исполнений при большой очереди впереди: котировки не доходят до сделки",
     "stale_holding": "Позиции держатся почти до max_hold_secs и выходы убыточны: инвентарь копится",
@@ -25,6 +26,42 @@ RULES_DOC = {
     "too_few_trades": "Слишком мало кругов за час: спред-порог или фильтр пар слишком жёсткие",
     "kill_switch": "Сработал дневной стоп-лосс",
 }
+
+
+QUEUE_BINS = [-0.01, 0.01, 1.0, 3.0, float("inf")]
+QUEUE_LABELS = ["0 (внутри спреда)", "<1x ордера", "1-3x", ">3x"]
+
+
+def markout_breakdowns(mo: pd.DataFrame, params_blob: dict, horizons=markouts.HORIZONS_S) -> dict[str, pd.DataFrame]:
+    """Entry markouts sliced by queue position, side, hour of day (UTC) and by the
+    reference signal at placement. Shows where the adverse selection comes from."""
+    if mo is None or len(mo) == 0 or "mo_5s" not in mo.columns:
+        return {}
+    df = mo[mo["purpose"] == "entry"].copy()
+    if len(df) == 0:
+        return {}
+    notional = df["symbol"].map(lambda s: float(db.strategy_params_for(params_blob, s).get("order_notional_usd", 100.0)))
+    df["queue_x"] = df["queue_ahead_initial"].astype(float).fillna(0.0) * df["price"].astype(float) / notional
+    df["queue_bucket"] = pd.cut(df["queue_x"], bins=QUEUE_BINS, labels=QUEUE_LABELS)
+    df["hour_utc"] = ((df["ts"] // 3_600_000) % 24).astype(int)
+    out = {
+        "by_queue": markouts.summarize_markouts(df, by=("queue_bucket",), horizons=horizons),
+        "by_side": markouts.summarize_markouts(df, by=("side",), horizons=horizons),
+        "by_hour": markouts.summarize_markouts(df, by=("hour_utc",), horizons=horizons),
+    }
+    if "ref_dev_bps" in df.columns and df["ref_dev_bps"].notna().any():
+        # did the reference venue say the price was moving against the side we quoted?
+        sgn = np.where(df["side"] == "Buy", 1.0, -1.0)
+        rd = df["ref_dev_bps"].astype(float).fillna(0.0) * sgn
+        df["ref_signal"] = pd.cut(rd, bins=[-np.inf, -2.0, 2.0, np.inf], labels=["против нас", "нейтрально", "за нас"])
+        out["by_ref"] = markouts.summarize_markouts(df, by=("ref_signal",), horizons=horizons)
+    for k, v in out.items():
+        if "queue_bucket" in v.columns:
+            v["queue_bucket"] = v["queue_bucket"].astype(str)
+        if "ref_signal" in v.columns:
+            v["ref_signal"] = v["ref_signal"].astype(str)
+        out[k] = v[v["n"] > 0].reset_index(drop=True)
+    return out
 
 
 def _round_sig(x: float, sig: int = 3) -> float:
@@ -53,6 +90,7 @@ def run_diagnostics(conn: sqlite3.Connection, md_dir: str, run_id: int, min_n: i
     mo = markouts.compute_markouts(fills, md_dir) if len(fills) else fills
     mo_entry = mo[mo["purpose"] == "entry"] if len(mo) else mo
     mo_sym = markouts.summarize_markouts(mo_entry, by=("symbol",)) if len(mo_entry) else pd.DataFrame()
+    breakdowns = markout_breakdowns(mo, params_blob) if len(mo) else {}
 
     recs: list[dict] = []
     symbols = sorted(set(fills["symbol"])) if len(fills) else []
@@ -177,12 +215,29 @@ def run_diagnostics(conn: sqlite3.Connection, md_dir: str, run_id: int, min_n: i
             "param": "min_spread_bps", "current_value": cur, "suggested_value": _round_sig(max(2 * 2.0 + 1.0, cur * 0.85)),
             "evidence": {"roundtrips_per_hour": rt_per_hour, "n_active": n_active, "hours": hours},
         })
+    # 9. back of the queue is toxic, front is fine -> queue priority (global)
+    bq = breakdowns.get("by_queue")
+    if bq is not None and len(bq) >= 2:
+        back = bq[bq["queue_bucket"].isin([">3x", "1-3x"])]
+        front = bq[bq["queue_bucket"].isin(["0 (внутри спреда)", "<1x ордера"])]
+        if len(back) and len(front) and back["n"].sum() >= min_n and front["n"].sum() >= min_n:
+            mb = float((back["mo_5s"] * back["n"]).sum() / back["n"].sum())
+            mf = float((front["mo_5s"] * front["n"]).sum() / front["n"].sum())
+            if mb < -1.0 and mf - mb > 2.0:
+                base = params_blob.get("strategy", {})
+                if base.get("quote_mode", "join") == "join":
+                    recs.append({
+                        "symbol": None, "rule": "back_of_queue", "severity": "high",
+                        "message": f"Входы из хвоста очереди дают markout {mb:.1f} bps, из головы {mf:.1f} bps. Нужен приоритет: котировать на тик внутрь спреда.",
+                        "param": "quote_mode", "current_value": "join", "suggested_value": "improve",
+                        "evidence": {"markout_back_bps": mb, "markout_front_bps": mf, "n_back": int(back["n"].sum()), "n_front": int(front["n"].sum())},
+                    })
     # 8. kill switch
     ks = conn.execute("SELECT ts, msg FROM events WHERE run_id = ? AND msg LIKE 'KILL SWITCH%' ORDER BY ts DESC LIMIT 1", (run_id,)).fetchone()
     if ks:
         recs.append({"symbol": None, "rule": "kill_switch", "severity": "high", "message": f"Сработал дневной стоп: {ks['msg']}", "param": None, "evidence": {"ts": int(ks["ts"])}})
 
-    return {"recommendations": recs, "per_symbol": per_sym, "markouts": mo_sym, "summary": summary, "roundtrips": rts, "hours": hours}
+    return {"recommendations": recs, "per_symbol": per_sym, "markouts": mo_sym, "breakdowns": breakdowns, "summary": summary, "roundtrips": rts, "hours": hours}
 
 
 def apply_recommendations(recs: list[dict], overrides_path: str, symbols_path: str) -> dict:

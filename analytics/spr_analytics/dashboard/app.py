@@ -9,7 +9,10 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, RedirectResponse
 
-from .. import db, roundtrips
+from .. import db, diagnostics, markouts, roundtrips
+
+MD_DIR = os.environ.get("SPR_MD_DIR", "data/md")
+_mo_cache: dict[int, tuple[int, dict]] = {}
 
 DB_PATH = os.environ.get("SPR_DB", "data/spr.db")
 STATIC = os.path.join(os.path.dirname(__file__), "static")
@@ -161,6 +164,30 @@ def api_roundtrips(run_id: int | None = None, limit: int = Query(300, le=5000)):
     }
     with _cache_lock:
         _rt_cache[rid] = (n_fills, out)
+    return out
+
+
+@app.get("/api/markouts")
+def api_markouts(run_id: int | None = None):
+    with conn() as c:
+        rid = resolve_run(c, run_id)
+        n_fills = c.execute("SELECT count(*) FROM fills WHERE run_id = ?", (rid,)).fetchone()[0]
+        with _cache_lock:
+            cached = _mo_cache.get(rid)
+        if cached and cached[0] == n_fills:
+            return cached[1]
+        fills = db.fills(c, rid)
+        params_blob = db.latest_params(c, rid)
+    out = {"by_symbol": [], "by_queue": [], "by_side": [], "by_hour": [], "by_ref": []}
+    if len(fills):
+        mo = markouts.compute_markouts(fills, MD_DIR)
+        entries = mo[mo["purpose"] == "entry"]
+        if len(entries):
+            out["by_symbol"] = json.loads(markouts.summarize_markouts(entries, by=("symbol",)).sort_values("n", ascending=False).to_json(orient="records"))
+        for k, v in diagnostics.markout_breakdowns(mo, params_blob).items():
+            out[k] = json.loads(v.to_json(orient="records"))
+    with _cache_lock:
+        _mo_cache[rid] = (n_fills, out)
     return out
 
 

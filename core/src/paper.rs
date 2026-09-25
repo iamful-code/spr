@@ -42,6 +42,8 @@ pub struct PaperOrder {
     pub spread_bps_at_place: f64,
     pub inventory_before: f64,
     pub param_version: u32,
+    pub ref_dev_bps: f64,
+    pub imbalance: f64,
 }
 
 impl PaperOrder {
@@ -65,6 +67,8 @@ pub struct PlaceReq {
     pub purpose: Purpose,
     pub inventory_before: f64,
     pub param_version: u32,
+    pub ref_dev_bps: f64,
+    pub imbalance: f64,
 }
 
 pub struct PaperExchange {
@@ -132,6 +136,8 @@ impl PaperExchange {
             spread_bps_at_place: if bbo.is_valid() { bbo.spread_bps() } else { 0.0 },
             inventory_before: req.inventory_before,
             param_version: req.param_version,
+            ref_dev_bps: req.ref_dev_bps,
+            imbalance: req.imbalance,
         };
         self.orders.insert(id, o);
         self.by_sym.entry(req.sym).or_default().push(id);
@@ -203,6 +209,8 @@ impl PaperExchange {
                 queue_ahead_initial: o.queue_ahead_initial,
                 inventory_before: o.inventory_before,
                 param_version: o.param_version,
+                ref_dev_bps: o.ref_dev_bps,
+                imbalance: o.imbalance,
             };
             (f, o.remaining() <= self.qty_eps)
         };
@@ -379,7 +387,7 @@ mod tests {
     }
 
     fn req(side: Side, price: f64, qty: f64) -> PlaceReq {
-        PlaceReq { sym: 0, side, price, qty, taker: false, purpose: Purpose::Entry, inventory_before: 0.0, param_version: 1 }
+        PlaceReq { sym: 0, side, price, qty, taker: false, purpose: Purpose::Entry, inventory_before: 0.0, param_version: 1, ref_dev_bps: 0.0, imbalance: 0.0 }
     }
 
     #[test]

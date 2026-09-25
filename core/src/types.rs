@@ -160,6 +160,8 @@ pub enum MarketEvent {
     Trades { sym: SymbolId, trades: Vec<Trade> },
     /// 24h turnover refresh from REST tickers: (symbol id, turnover).
     Turnover(Vec<(SymbolId, f64)>),
+    /// Top of book of the same coin on a leading venue; `rank` = provider priority (0 = best).
+    Reference { sym: SymbolId, ts: i64, bid: f64, ask: f64, rank: u8 },
     /// Connection status message for logging / dashboard.
     Status { conn: usize, msg: String },
 }
@@ -170,6 +172,7 @@ pub enum Purpose {
     Entry,
     Exit,
     StaleExit,
+    StopLoss,
 }
 
 impl Purpose {
@@ -178,6 +181,7 @@ impl Purpose {
             Purpose::Entry => "entry",
             Purpose::Exit => "exit",
             Purpose::StaleExit => "stale_exit",
+            Purpose::StopLoss => "stop_loss",
         }
     }
 }
@@ -204,6 +208,9 @@ pub struct Fill {
     pub queue_ahead_initial: f64,
     pub inventory_before: f64,
     pub param_version: u32,
+    /// Signals at placement: reference deviation (bps) and top-of-book imbalance.
+    pub ref_dev_bps: f64,
+    pub imbalance: f64,
 }
 
 /// Final state of an order (written once, when it leaves the book).

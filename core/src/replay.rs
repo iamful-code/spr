@@ -90,6 +90,7 @@ pub fn run_replay(mut cfg: Config, mut overrides: Overrides, lists: SymbolLists,
             let mev = match ev {
                 MdEvent::Bbo(b) => MarketEvent::Bbo { sym, bbo: Bbo { ts, bid: b.bid, ask: b.ask, bid_qty: b.bid_qty, ask_qty: b.ask_qty } },
                 MdEvent::Trade(t) => MarketEvent::Trades { sym, trades: vec![Trade { ts, price: t.price, qty: t.qty, taker_side: Side::from_u8(t.side) }] },
+                MdEvent::Ref(b) => MarketEvent::Reference { sym, ts, bid: b.bid, ask: b.ask, rank: 0 },
             };
             engine.on_market(mev, ts);
         })?;

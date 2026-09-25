@@ -7,6 +7,7 @@ use crate::types::{Bbo, MarketEvent, Side, SymbolId, SymbolMeta, Trade};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, LogNormal, Normal, Poisson};
+use std::collections::VecDeque;
 
 #[derive(Clone, Debug)]
 pub struct SimParams {
@@ -15,11 +16,14 @@ pub struct SimParams {
     pub step_ms: i64,
     /// 0 = trade sides independent of future moves, 1 = fully informed flow.
     pub toxicity: f64,
+    /// The synthetic perp book follows the "true" (reference) price with this lag, ms.
+    /// 0 = no reference feed.
+    pub ref_lag_ms: i64,
 }
 
 impl Default for SimParams {
     fn default() -> Self {
-        Self { n_symbols: 20, seed: 42, step_ms: 100, toxicity: 0.4 }
+        Self { n_symbols: 20, seed: 42, step_ms: 100, toxicity: 0.4, ref_lag_ms: 300 }
     }
 }
 
@@ -36,6 +40,10 @@ struct SimSym {
     size_scale: f64,
     last_bbo: Option<Bbo>,
     last_emit_ts: i64,
+    /// recent true mids; the book is built from the oldest one (the lag)
+    mid_hist: VecDeque<f64>,
+    last_ref_mid: f64,
+    last_ref_ts: i64,
 }
 
 pub struct SimFeed {
@@ -44,6 +52,7 @@ pub struct SimFeed {
     pub t: i64,
     step_ms: i64,
     toxicity: f64,
+    lag_steps: usize,
     normal: Normal<f64>,
     size_dist: LogNormal<f64>,
 }
@@ -102,6 +111,9 @@ impl SimFeed {
                 size_scale,
                 last_bbo: None,
                 last_emit_ts: 0,
+                mid_hist: VecDeque::new(),
+                last_ref_mid: 0.0,
+                last_ref_ts: 0,
             });
         }
         Self {
@@ -110,6 +122,7 @@ impl SimFeed {
             t: start_ts,
             step_ms: p.step_ms,
             toxicity: p.toxicity.clamp(0.0, 1.0),
+            lag_steps: if p.ref_lag_ms > 0 { ((p.ref_lag_ms + p.step_ms - 1) / p.step_ms).max(1) as usize } else { 0 },
             normal: Normal::new(0.0, 1.0).unwrap(),
             size_dist: LogNormal::new(0.0, 1.0).unwrap(),
         }
@@ -119,11 +132,21 @@ impl SimFeed {
         self.syms.iter().map(|s| s.meta.clone()).collect()
     }
 
+    /// The mid the book is built from: the true mid delayed by the lag.
+    fn book_mid(&self, s: &SimSym) -> f64 {
+        if self.lag_steps > 0 {
+            s.mid_hist.front().copied().unwrap_or(s.mid)
+        } else {
+            s.mid
+        }
+    }
+
     fn bbo_of(&self, s: &SimSym, ts: i64) -> Bbo {
         let tick = s.meta.tick_size;
         let ticks = s.spread_ticks.round().max(1.0);
         let half = ticks * tick / 2.0;
-        let bid = ((s.mid - half) / tick).floor() * tick;
+        let mid = self.book_mid(s);
+        let bid = ((mid - half) / tick).floor() * tick;
         let bid = s.meta.round_price(bid);
         let ask = s.meta.round_price(bid + ticks * tick);
         Bbo { ts, bid, ask, bid_qty: 0.0, ask_qty: 0.0 }
@@ -154,7 +177,10 @@ impl SimFeed {
                 let bbo = self.bbo_of(&self.syms[i], t);
                 let mut trades = Vec::with_capacity(n_trades);
                 let drift_sign = self.syms[i].drift.signum();
-                let p_buy = 0.5 + 0.5 * self.toxicity * drift_sign;
+                // informed flow: regime direction, plus arbitrageurs who see the true price
+                // while the book still shows the lagged one
+                let gap = (self.syms[i].mid - bbo.mid()) / ((bbo.ask - bbo.bid) * 0.5).max(1e-12);
+                let p_buy = (0.5 + 0.5 * self.toxicity * drift_sign + 0.3 * self.toxicity * gap.clamp(-1.0, 1.0)).clamp(0.05, 0.95);
                 let mut impact_sum = 0.0;
                 for k in 0..n_trades {
                     let buy = self.rng.gen::<f64>() < p_buy;
@@ -175,8 +201,15 @@ impl SimFeed {
             // price and spread dynamics
             let z = self.normal.sample(&mut self.rng);
             let z2 = self.normal.sample(&mut self.rng);
+            let lag_steps = self.lag_steps;
             let s = &mut self.syms[i];
             s.mid *= (s.drift + s.sigma_step * z).exp();
+            if lag_steps > 0 {
+                s.mid_hist.push_back(s.mid);
+                while s.mid_hist.len() > lag_steps {
+                    s.mid_hist.pop_front();
+                }
+            }
             let widen = if s.drift != 0.0 { 1.3 } else { 1.0 };
             let target = s.spread_mean_ticks * widen;
             s.spread_ticks += 0.05 * (target - s.spread_ticks) + 0.15 * target * z2;
@@ -195,6 +228,17 @@ impl SimFeed {
                 s.last_emit_ts = t;
                 out.push(MarketEvent::Bbo { sym: i as SymbolId, bbo });
             }
+            // reference venue: the true price, one tick wide, whenever it moved a tick
+            if lag_steps > 0 {
+                let tick = s.meta.tick_size;
+                let ref_mid = s.meta.round_price(s.mid);
+                if (ref_mid - s.last_ref_mid).abs() >= tick * 0.5 || t - s.last_ref_ts >= 1000 {
+                    s.last_ref_mid = ref_mid;
+                    s.last_ref_ts = t;
+                    // one tick each side of the true price: the reference mid is exact
+                    out.push(MarketEvent::Reference { sym: i as SymbolId, ts: t, bid: s.meta.round_price(ref_mid - tick), ask: s.meta.round_price(ref_mid + tick), rank: 0 });
+                }
+            }
         }
     }
 }
@@ -205,7 +249,7 @@ mod tests {
 
     #[test]
     fn generates_consistent_books_and_trades() {
-        let mut f = SimFeed::new(&SimParams { n_symbols: 5, seed: 1, step_ms: 100, toxicity: 0.5 }, 1_700_000_000_000);
+        let mut f = SimFeed::new(&SimParams { n_symbols: 5, seed: 1, step_ms: 100, toxicity: 0.5, ref_lag_ms: 300 }, 1_700_000_000_000);
         let mut out = Vec::new();
         let mut n_bbo = 0;
         let mut n_trd = 0;
@@ -224,6 +268,7 @@ mod tests {
                             n_trd += 1;
                         }
                     }
+                    MarketEvent::Reference { bid, ask, .. } => assert!(ask > bid && bid > 0.0),
                     _ => panic!("unexpected event"),
                 }
             }

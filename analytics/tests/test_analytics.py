@@ -124,6 +124,10 @@ def test_diagnostics_adverse_selection_and_losing_symbol(tmp_path):
     rules = {r["rule"] for r in res["recommendations"]}
     assert "adverse_selection" in rules
     assert "losing_symbol" in rules
+    bd = res["breakdowns"]
+    assert set(bd) >= {"by_queue", "by_side", "by_hour"}
+    assert bd["by_side"]["n"].sum() == 40 and bd["by_side"].iloc[0]["mo_5s"] < 0
+    assert list(bd["by_queue"]["queue_bucket"]) == ["0 (внутри спреда)"]
     n = db.write_recommendations(conn, run_id, res["recommendations"])
     assert n == len(res["recommendations"])
     assert conn.execute("SELECT count(*) FROM recommendations WHERE status='open'").fetchone()[0] == n
@@ -178,9 +182,14 @@ def test_pairs_scoring(tmp_path):
         conn.execute("INSERT INTO symbol_stats(run_id, ts, symbol, spread_med_bps, spread_mean_bps, vol_bps, trades_per_min, turnover_24h, eligible, reason, score, active, bid, ask, position_qty, quote_reason)"
                      " VALUES (1, ?, 'THINUSDT', 2, 2, 5, 3, 1e6, 0, 'spread_low', 0, 0, 1, 1.0002, 0, 'inactive')", (now - i * 60_000,))
     conn.commit()
+    conn.execute("INSERT INTO symbol_stats(run_id, ts, symbol, spread_med_bps, spread_mean_bps, vol_bps, trades_per_min, turnover_24h, eligible, reason, score, active, bid, ask, position_qty, quote_reason, markout_bps, markout_n)"
+                 " VALUES (1, ?, 'TOXICUSDT', 25, 25, 5, 40, 1e7, 1, 'ok', 60, 1, 1, 1.0025, 0, 'ok', -8.0, 50)", (now,))
+    conn.commit()
     df = pairs.score_pairs(conn, lookback_hours=1)
     assert list(df["symbol"])[0] == "GOODUSDT"
     assert df.iloc[0]["verdict"] == "good"
+    assert df[df["symbol"] == "TOXICUSDT"].iloc[0]["verdict"] == "deny"
     out = pairs.write_symbols_json(df, str(tmp_path / "symbols.json"), allow_top=1)
     assert out["allow"] == ["GOODUSDT"] and "GOODUSDT" in out["scores"]
-    assert db.write_pair_scores(conn, df) == 2
+    assert out["deny"] == ["TOXICUSDT"]
+    assert db.write_pair_scores(conn, df) == 3

@@ -108,13 +108,15 @@ pub struct Recorder {
     day: i64,
     bbo: Option<BufWriter<File>>,
     trd: Option<BufWriter<File>>,
+    rf: Option<BufWriter<File>>,
     pub bbo_count: u64,
     pub trd_count: u64,
+    pub ref_count: u64,
 }
 
 impl Recorder {
     pub fn new(md_dir: &Path, run_id: i64, symbols: Vec<SymbolMeta>) -> Self {
-        Self { md_dir: md_dir.to_path_buf(), run_id, symbols, day: -1, bbo: None, trd: None, bbo_count: 0, trd_count: 0 }
+        Self { md_dir: md_dir.to_path_buf(), run_id, symbols, day: -1, bbo: None, trd: None, rf: None, bbo_count: 0, trd_count: 0, ref_count: 0 }
     }
 
     fn ensure_day(&mut self, ts: i64) -> Result<()> {
@@ -132,6 +134,7 @@ impl Recorder {
         };
         self.bbo = Some(open(format!("run{}_bbo.bin", self.run_id))?);
         self.trd = Some(open(format!("run{}_trd.bin", self.run_id))?);
+        self.rf = Some(open(format!("run{}_ref.bin", self.run_id))?);
         let sym_path = dir.join(format!("run{}_symbols.json", self.run_id));
         if !sym_path.exists() {
             fs::write(&sym_path, serde_json::to_vec(&self.symbols)?)?;
@@ -154,11 +157,16 @@ impl Recorder {
         Ok(())
     }
 
+    /// Reference-venue top of book, same record layout as BBO (sizes are zero).
+    pub fn write_ref(&mut self, r: &BboRec) -> Result<()> {
+        self.ensure_day(r.ts)?;
+        self.rf.as_mut().unwrap().write_all(&r.to_bytes())?;
+        self.ref_count += 1;
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> Result<()> {
-        if let Some(w) = self.bbo.as_mut() {
-            w.flush()?;
-        }
-        if let Some(w) = self.trd.as_mut() {
+        for w in [self.bbo.as_mut(), self.trd.as_mut(), self.rf.as_mut()].into_iter().flatten() {
             w.flush()?;
         }
         Ok(())
@@ -185,6 +193,9 @@ impl Segment {
     }
     pub fn trd_path(&self) -> PathBuf {
         self.dir.join(format!("run{}_trd.bin", self.run_id))
+    }
+    pub fn ref_path(&self) -> PathBuf {
+        self.dir.join(format!("run{}_ref.bin", self.run_id))
     }
 }
 
@@ -224,18 +235,19 @@ pub fn list_segments(md_dir: &Path, from_ms: i64, to_ms: i64) -> Result<Vec<Segm
 pub enum MdEvent {
     Bbo(BboRec),
     Trade(TrdRec),
+    Ref(BboRec),
 }
 
 impl MdEvent {
     pub fn ts(&self) -> i64 {
         match self {
-            MdEvent::Bbo(b) => b.ts,
+            MdEvent::Bbo(b) | MdEvent::Ref(b) => b.ts,
             MdEvent::Trade(t) => t.ts,
         }
     }
     pub fn sym(&self) -> SymbolId {
         match self {
-            MdEvent::Bbo(b) => b.sym,
+            MdEvent::Bbo(b) | MdEvent::Ref(b) => b.sym,
             MdEvent::Trade(t) => t.sym,
         }
     }
@@ -263,45 +275,49 @@ impl RecStream {
 
 /// Streams the events of one segment in timestamp order, filtered by time range and
 /// (optionally) by local symbol id. Memory use is constant regardless of file size.
+/// At equal timestamps the order is trades, book, reference.
 pub fn read_segment(seg: &Segment, from_ms: i64, to_ms: i64, syms: Option<&HashSet<SymbolId>>, mut f: impl FnMut(MdEvent)) -> Result<(u64, u64)> {
-    let mut bs = RecStream::open(&seg.bbo_path(), BBO_REC_SIZE)?;
-    let mut ts_ = RecStream::open(&seg.trd_path(), TRD_REC_SIZE)?;
+    let mut streams = [RecStream::open(&seg.trd_path(), TRD_REC_SIZE)?, RecStream::open(&seg.bbo_path(), BBO_REC_SIZE)?, RecStream::open(&seg.ref_path(), BBO_REC_SIZE)?];
+    let decode = |i: usize, buf: &[u8]| -> MdEvent {
+        match i {
+            0 => MdEvent::Trade(TrdRec::from_bytes(buf)),
+            1 => MdEvent::Bbo(BboRec::from_bytes(buf)),
+            _ => MdEvent::Ref(BboRec::from_bytes(buf)),
+        }
+    };
+    let mut cur: [Option<MdEvent>; 3] = [None, None, None];
+    for i in 0..3 {
+        if streams[i].next_raw()? {
+            cur[i] = Some(decode(i, &streams[i].buf));
+        }
+    }
     let mut nb = 0u64;
     let mut nt = 0u64;
     let keep = |sym: SymbolId, ts: i64| ts >= from_ms && ts <= to_ms && syms.is_none_or(|s| s.contains(&sym));
-
-    let mut cur_b: Option<BboRec> = if bs.next_raw()? { Some(BboRec::from_bytes(&bs.buf)) } else { None };
-    let mut cur_t: Option<TrdRec> = if ts_.next_raw()? { Some(TrdRec::from_bytes(&ts_.buf)) } else { None };
     loop {
-        // Trades sort before BBOs at equal timestamps: a trade is what moved the book.
-        let take_b = match (&cur_b, &cur_t) {
-            (Some(b), Some(t)) => b.ts < t.ts,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (None, None) => break,
-        };
-        if take_b {
-            let b = cur_b.take().unwrap();
-            if b.ts > to_ms {
-                cur_b = None;
-            } else {
-                if keep(b.sym, b.ts) {
-                    nb += 1;
-                    f(MdEvent::Bbo(b));
+        // pick the stream with the smallest timestamp; ties go to the lower index
+        let mut best: Option<(usize, i64)> = None;
+        for (i, c) in cur.iter().enumerate() {
+            if let Some(e) = c {
+                if best.is_none_or(|(_, t)| e.ts() < t) {
+                    best = Some((i, e.ts()));
                 }
-                cur_b = if bs.next_raw()? { Some(BboRec::from_bytes(&bs.buf)) } else { None };
             }
-        } else {
-            let t = cur_t.take().unwrap();
-            if t.ts > to_ms {
-                cur_t = None;
-            } else {
-                if keep(t.sym, t.ts) {
-                    nt += 1;
-                    f(MdEvent::Trade(t));
-                }
-                cur_t = if ts_.next_raw()? { Some(TrdRec::from_bytes(&ts_.buf)) } else { None };
+        }
+        let Some((i, ts)) = best else { break };
+        let ev = cur[i].take().unwrap();
+        if ts > to_ms {
+            continue; // this stream is exhausted for the period
+        }
+        if keep(ev.sym(), ts) {
+            match ev {
+                MdEvent::Trade(_) => nt += 1,
+                _ => nb += 1,
             }
+            f(ev);
+        }
+        if streams[i].next_raw()? {
+            cur[i] = Some(decode(i, &streams[i].buf));
         }
     }
     Ok((nb, nt))

@@ -60,6 +60,9 @@ enum Cmd {
         /// Share of informed (toxic) flow, 0..1
         #[arg(long, default_value_t = 0.4)]
         toxicity: f64,
+        /// Lag of the synthetic book behind the reference price, ms (0 = no reference feed)
+        #[arg(long, default_value_t = 300)]
+        ref_lag_ms: i64,
         #[arg(long)]
         no_record: bool,
     },
@@ -103,7 +106,7 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
             rt.block_on(cmd_run(&cli.config, instruments_file, symbols, max_symbols, no_record, duration_secs))
         }
-        Cmd::Sim { symbols, duration_secs, speed, seed, toxicity, no_record } => cmd_sim(&cli.config, symbols, duration_secs, speed, seed, toxicity, no_record),
+        Cmd::Sim { symbols, duration_secs, speed, seed, toxicity, ref_lag_ms, no_record } => cmd_sim(&cli.config, symbols, duration_secs, speed, seed, toxicity, ref_lag_ms, no_record),
         Cmd::Replay { from, to, symbols, params_json, md_dir, record } => cmd_replay(&cli.config, &from, &to, symbols, params_json, md_dir, record),
         Cmd::Symbols { out, instruments_file } => {
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -194,7 +197,24 @@ async fn cmd_run(config_path: &Path, instruments_file: Option<PathBuf>, symbols:
     let mut engine = Engine::new(cfg.clone(), overrides, lists, metas.clone(), store.handle.clone(), Some(watcher), run_id, "live", run_id);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<MarketEvent>(65_536);
-    let handles = bybit::ws::spawn_connections(&cfg.exchange, &metas, tx.clone());
+    let mut handles = bybit::ws::spawn_connections(&cfg.exchange, &metas, tx.clone());
+    if cfg.reference.enabled {
+        for (rank, provider) in cfg.reference.providers.iter().enumerate() {
+            let rank = rank as u8;
+            let per = cfg.reference.symbols_per_connection;
+            let hs = match provider.as_str() {
+                "binance_futures" => spr_core::binance::spawn(spr_core::binance::FUTURES_URL, "ref:binance_futures", &metas, rank, per, tx.clone()),
+                "binance_spot" => spr_core::binance::spawn(spr_core::binance::SPOT_URL, "ref:binance_spot", &metas, rank, per, tx.clone()),
+                "bybit_spot" => bybit::ws::spawn_reference_connections("wss://stream.bybit.com/v5/public/spot", "ref:bybit_spot", &metas, rank, per, tx.clone()),
+                other => {
+                    tracing::warn!("unknown reference provider '{other}' (use binance_futures, binance_spot or bybit_spot)");
+                    Vec::new()
+                }
+            };
+            tracing::info!("reference feed {provider} (rank {rank}): {} connections", hs.len());
+            handles.extend(hs);
+        }
+    }
 
     // periodic turnover refresh
     let tick_tx = tx.clone();
@@ -249,19 +269,20 @@ async fn cmd_run(config_path: &Path, instruments_file: Option<PathBuf>, symbols:
 // sim
 // ------------------------------------------------------------------------------------
 
-fn cmd_sim(config_path: &Path, n_symbols: usize, duration_secs: u64, speed: f64, seed: u64, toxicity: f64, no_record: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_sim(config_path: &Path, n_symbols: usize, duration_secs: u64, speed: f64, seed: u64, toxicity: f64, ref_lag_ms: i64, no_record: bool) -> Result<()> {
     let watcher = ConfigWatcher::new(config_path);
     let (mut cfg, overrides, lists) = watcher.load_all()?;
     if no_record {
         cfg.recording.enabled = false;
     }
     let start = now_ms();
-    let mut feed = SimFeed::new(&SimParams { n_symbols, seed, step_ms: 100, toxicity }, start);
+    let mut feed = SimFeed::new(&SimParams { n_symbols, seed, step_ms: 100, toxicity, ref_lag_ms }, start);
     let metas = feed.metas();
     let run_id = start;
     let store = open_store(Path::new(&cfg.storage.db_path), Path::new(&cfg.storage.md_dir), run_id, metas.clone(), cfg.recording.enabled)?;
     let mut engine = Engine::new(cfg, overrides, lists, metas, store.handle.clone(), Some(watcher), run_id, "sim", start);
-    tracing::info!("sim run {run_id}: {n_symbols} symbols, {duration_secs}s, speed {speed}, toxicity {toxicity}");
+    tracing::info!("sim run {run_id}: {n_symbols} symbols, {duration_secs}s, speed {speed}, toxicity {toxicity}, reference lag {ref_lag_ms} ms");
 
     let end = start + duration_secs as i64 * 1000;
     let wall_start = std::time::Instant::now();

@@ -1,5 +1,11 @@
 //! Quote generation. A pure function of the market state, position and parameters,
 //! so it is trivially reusable by the live engine and the replay optimizer.
+//!
+//! The quotes are placed around a *fair value*, not around the mid: the top-of-book size
+//! imbalance, the recent taker flow and the deviation of a leading venue's price all shift
+//! the fair price, and a side whose quote would have to sit too deep behind the best level
+//! to keep the required edge is simply not quoted. This is what turns "sit at the best
+//! price and get run over" into "quote where the informed flow is not coming from".
 
 use crate::config::StrategyParams;
 use crate::stats::SymbolStats;
@@ -11,7 +17,7 @@ pub struct Quote {
     pub price: f64,
     pub qty: f64,
     pub purpose: Purpose,
-    /// true = cross the spread with a taker order (only for stale exits)
+    /// true = cross the spread with a taker order (stale exits and stop-losses)
     pub taker: bool,
 }
 
@@ -21,6 +27,8 @@ pub struct Quotes {
     pub ask: Option<Quote>,
     /// Human-readable reason when one or both sides are withheld.
     pub reason: &'static str,
+    /// Fair value shift that was applied, in bps of mid (positive = price expected to rise).
+    pub fair_shift_bps: f64,
 }
 
 pub struct QuoteInput<'a> {
@@ -37,6 +45,46 @@ pub struct QuoteInput<'a> {
     pub allow_new_exposure: bool,
     /// Symbol dropped out of the active set: only reduce.
     pub reduce_only: bool,
+    /// (reference mid + basis - our mid) / our mid in bps; 0 when no fresh reference.
+    pub ref_dev_bps: f64,
+}
+
+fn floor_tick(meta: &SymbolMeta, px: f64) -> f64 {
+    meta.ticks_to_price((px / meta.tick_size + 1e-9).floor() as i64)
+}
+
+fn ceil_tick(meta: &SymbolMeta, px: f64) -> f64 {
+    meta.ticks_to_price((px / meta.tick_size - 1e-9).ceil() as i64)
+}
+
+/// Build the exit quote for a position that must leave now (stale or stop-loss).
+fn forced_exit(inp: &QuoteInput, mode: &str, purpose: Purpose) -> Option<Quote> {
+    let meta = inp.meta;
+    let bbo = inp.bbo;
+    let side = if inp.position_qty > 0.0 { Side::Sell } else { Side::Buy };
+    let qty = meta.round_qty_down(inp.position_qty.abs());
+    if qty <= 0.0 {
+        return None;
+    }
+    let (price, taker) = if mode == "taker" {
+        (if side == Side::Sell { bbo.bid } else { bbo.ask }, true)
+    } else {
+        // improve by one tick inside the spread when there is room, else join
+        let improved = if side == Side::Sell { bbo.ask - meta.tick_size } else { bbo.bid + meta.tick_size };
+        let px = if side == Side::Sell {
+            if improved > bbo.bid {
+                improved
+            } else {
+                bbo.ask
+            }
+        } else if improved < bbo.ask {
+            improved
+        } else {
+            bbo.bid
+        };
+        (meta.round_price(px), false)
+    };
+    Some(Quote { side, price, qty, purpose, taker })
 }
 
 /// Compute the desired quotes. Returns empty quotes with a reason when the symbol should not be quoted.
@@ -56,27 +104,26 @@ pub fn compute_quotes(inp: &QuoteInput) -> Quotes {
     let pos_notional = inp.position_qty * mid;
     let have_pos = inp.position_qty.abs() * mid >= meta.min_notional.max(1.0);
 
+    // ---- stop-loss: the mid moved against the position beyond the limit ----
+    if have_pos && p.stop_loss_bps > 0.0 && inp.position_avg > 0.0 {
+        let adverse_bps = -(inp.position_qty.signum()) * (mid - inp.position_avg) / inp.position_avg * 1e4;
+        if adverse_bps >= p.stop_loss_bps {
+            if let Some(q) = forced_exit(inp, &p.stop_loss_mode, Purpose::StopLoss) {
+                if q.side == Side::Sell {
+                    out.ask = Some(q);
+                } else {
+                    out.bid = Some(q);
+                }
+            }
+            out.reason = "stop_loss";
+            return out;
+        }
+    }
+
     // ---- stale inventory: exit first, no matter what the spread looks like ----
     if have_pos && inp.position_age_secs >= p.max_hold_secs {
-        let side = if inp.position_qty > 0.0 { Side::Sell } else { Side::Buy };
-        let qty = meta.round_qty_down(inp.position_qty.abs());
-        if qty > 0.0 {
-            let (price, taker) = if p.stale_exit_mode == "taker" {
-                (if side == Side::Sell { bbo.bid } else { bbo.ask }, true)
-            } else {
-                // improve by one tick inside the spread when there is room, else join
-                let improved = if side == Side::Sell { bbo.ask - meta.tick_size } else { bbo.bid + meta.tick_size };
-                let px = if side == Side::Sell {
-                    if improved > bbo.bid { improved } else { bbo.ask }
-                } else if improved < bbo.ask {
-                    improved
-                } else {
-                    bbo.bid
-                };
-                (meta.round_price(px), false)
-            };
-            let q = Quote { side, price, qty, purpose: Purpose::StaleExit, taker };
-            if side == Side::Sell {
+        if let Some(q) = forced_exit(inp, &p.stale_exit_mode, Purpose::StaleExit) {
+            if q.side == Side::Sell {
                 out.ask = Some(q);
             } else {
                 out.bid = Some(q);
@@ -97,7 +144,7 @@ pub fn compute_quotes(inp: &QuoteInput) -> Quotes {
     // Minimum total spread we need: fees on both legs plus the edge target.
     let required_bps = p.min_spread_bps.max(2.0 * inp.maker_fee * 1e4 + p.min_edge_bps);
 
-    // Decide prices: join the best level or improve by one tick when the spread allows.
+    // Decide base prices: join the best level or improve by one tick when the spread allows.
     let improve = p.quote_mode == "improve" && spread_bps - 2.0 * tick_bps >= required_bps;
     let (mut bid_px, mut ask_px) = if improve {
         (bbo.bid + meta.tick_size, bbo.ask - meta.tick_size)
@@ -111,12 +158,30 @@ pub fn compute_quotes(inp: &QuoteInput) -> Quotes {
         return out;
     }
 
-    // Inventory skew: shift both quotes against the position, in whole ticks.
-    let inv_ratio = if p.max_position_notional_usd > 0.0 {
-        (pos_notional / p.max_position_notional_usd).clamp(-1.0, 1.0)
-    } else {
-        0.0
-    };
+    // ---- fair value: where the price is likely to be in a moment ----
+    let half = (bbo.ask - bbo.bid) * 0.5;
+    let book_imb = bbo.imbalance();
+    let flow_imb = inp.stats.flow_imbalance(inp.now_ms, p.toxicity_window_secs);
+    let shift = (p.imbalance_weight * book_imb + p.flow_weight * flow_imb) * half + p.ref_weight * inp.ref_dev_bps / 1e4 * mid;
+    let fair = mid + shift;
+    out.fair_shift_bps = shift / mid * 1e4;
+    // each quote keeps at least half of the required spread away from fair value
+    let req_half = required_bps * 0.5 / 1e4 * mid;
+    let mut lean_bid = false;
+    let mut lean_ask = false;
+    if bid_px > fair - req_half {
+        bid_px = floor_tick(meta, fair - req_half);
+        let ticks_behind = ((bbo.bid - bid_px) / meta.tick_size).round() as i64;
+        lean_bid = ticks_behind > p.max_lean_ticks;
+    }
+    if ask_px < fair + req_half {
+        ask_px = ceil_tick(meta, fair + req_half);
+        let ticks_behind = ((ask_px - bbo.ask) / meta.tick_size).round() as i64;
+        lean_ask = ticks_behind > p.max_lean_ticks;
+    }
+
+    // ---- inventory skew: shift both quotes against the position, in whole ticks ----
+    let inv_ratio = if p.max_position_notional_usd > 0.0 { (pos_notional / p.max_position_notional_usd).clamp(-1.0, 1.0) } else { 0.0 };
     let skew_bps = p.inventory_skew_bps * inv_ratio;
     if skew_bps.abs() > 0.0 && tick_bps > 0.0 {
         let mut ticks = (skew_bps / tick_bps).round();
@@ -129,23 +194,26 @@ pub fn compute_quotes(inp: &QuoteInput) -> Quotes {
         // long => push both quotes down (sell sooner, buy later); short => push up
         bid_px -= skew_ticks;
         ask_px -= skew_ticks;
-        // never cross the market: keep quotes passive
-        if bid_px >= bbo.ask {
-            bid_px = bbo.bid;
-        }
-        if ask_px <= bbo.bid {
-            ask_px = bbo.ask;
-        }
+    }
+    // never cross the market: keep quotes passive
+    if bid_px >= bbo.ask {
+        bid_px = bbo.bid;
+    }
+    if ask_px <= bbo.bid {
+        ask_px = bbo.ask;
     }
     bid_px = meta.round_price(bid_px);
     ask_px = meta.round_price(ask_px);
 
-    // Toxic flow filter: heavy net buying means price likely rises; don't sell into it.
-    let imb = inp.stats.flow_imbalance(inp.now_ms, p.toxicity_window_secs);
-    let block_ask = p.toxicity_imbalance > 0.0 && imb > p.toxicity_imbalance;
-    let block_bid = p.toxicity_imbalance > 0.0 && imb < -p.toxicity_imbalance;
+    // ---- hard blocks: toxic flow and a reference that already moved ----
+    let tox_ask = p.toxicity_imbalance > 0.0 && flow_imb > p.toxicity_imbalance;
+    let tox_bid = p.toxicity_imbalance > 0.0 && flow_imb < -p.toxicity_imbalance;
+    let ref_ask = p.ref_block_bps > 0.0 && inp.ref_dev_bps > p.ref_block_bps;
+    let ref_bid = p.ref_block_bps > 0.0 && inp.ref_dev_bps < -p.ref_block_bps;
+    let block_bid = tox_bid || ref_bid || lean_bid;
+    let block_ask = tox_ask || ref_ask || lean_ask;
 
-    // Sizes.
+    // ---- sizes ----
     let base_qty = meta.round_qty_down(p.order_notional_usd / mid);
     if base_qty <= 0.0 || base_qty * mid < meta.min_notional {
         out.reason = "size_below_min";
@@ -156,9 +224,7 @@ pub fn compute_quotes(inp: &QuoteInput) -> Quotes {
 
     // BID (buy): entry when short/flat room exists; when long at cap, no bid.
     let bid_purpose = if inp.position_qty < 0.0 { Purpose::Exit } else { Purpose::Entry };
-    let bid_allowed = !block_bid
-        && room_long >= p.order_notional_usd * 0.5
-        && (bid_purpose == Purpose::Exit || (inp.allow_new_exposure && !inp.reduce_only));
+    let bid_allowed = !block_bid && room_long >= p.order_notional_usd * 0.5 && (bid_purpose == Purpose::Exit || (inp.allow_new_exposure && !inp.reduce_only));
     if bid_allowed {
         let mut qty = base_qty;
         if bid_purpose == Purpose::Exit {
@@ -174,9 +240,7 @@ pub fn compute_quotes(inp: &QuoteInput) -> Quotes {
 
     // ASK (sell)
     let ask_purpose = if inp.position_qty > 0.0 { Purpose::Exit } else { Purpose::Entry };
-    let ask_allowed = !block_ask
-        && room_short >= p.order_notional_usd * 0.5
-        && (ask_purpose == Purpose::Exit || (inp.allow_new_exposure && !inp.reduce_only));
+    let ask_allowed = !block_ask && room_short >= p.order_notional_usd * 0.5 && (ask_purpose == Purpose::Exit || (inp.allow_new_exposure && !inp.reduce_only));
     if ask_allowed {
         let mut qty = base_qty;
         if ask_purpose == Purpose::Exit {
@@ -190,8 +254,12 @@ pub fn compute_quotes(inp: &QuoteInput) -> Quotes {
     }
 
     out.reason = if out.bid.is_none() && out.ask.is_none() {
-        if block_bid || block_ask {
+        if ref_bid || ref_ask {
+            "ref_block"
+        } else if tox_bid || tox_ask {
             "toxic_flow"
+        } else if lean_bid || lean_ask {
+            "lean_out"
         } else if inp.reduce_only {
             "reduce_only"
         } else if !inp.allow_new_exposure {
@@ -199,8 +267,12 @@ pub fn compute_quotes(inp: &QuoteInput) -> Quotes {
         } else {
             "position_cap"
         }
-    } else if block_bid || block_ask {
+    } else if ref_bid || ref_ask {
+        "ref_one_side"
+    } else if tox_bid || tox_ask {
         "toxic_one_side"
+    } else if lean_bid || lean_ask {
+        "lean_one_side"
     } else {
         "ok"
     };
@@ -245,6 +317,11 @@ mod tests {
         }
     }
 
+    /// Parameters with the fair-value model switched off, to test the classic behaviour.
+    fn plain() -> StrategyParams {
+        StrategyParams { imbalance_weight: 0.0, flow_weight: 0.0, ref_weight: 0.0, ref_block_bps: 0.0, stop_loss_bps: 0.0, ..StrategyParams::default() }
+    }
+
     fn input<'a>(meta: &'a SymbolMeta, bbo: &'a Bbo, stats: &'a SymbolStats, params: &'a StrategyParams) -> QuoteInput<'a> {
         QuoteInput {
             meta,
@@ -258,6 +335,7 @@ mod tests {
             now_ms: 1_700_000_000_000,
             allow_new_exposure: true,
             reduce_only: false,
+            ref_dev_bps: 0.0,
         }
     }
 
@@ -267,7 +345,7 @@ mod tests {
         // spread 0.02 on ~1.0 => 200 bps
         let bbo = Bbo { ts: 0, bid: 1.000, ask: 1.020, bid_qty: 100.0, ask_qty: 100.0 };
         let st = SymbolStats::new(60);
-        let p = StrategyParams::default();
+        let p = plain();
         let q = compute_quotes(&input(&m, &bbo, &st, &p));
         assert_eq!(q.reason, "ok");
         let b = q.bid.unwrap();
@@ -279,11 +357,24 @@ mod tests {
     }
 
     #[test]
+    fn balanced_book_with_default_model_still_joins() {
+        let m = meta();
+        let bbo = Bbo { ts: 0, bid: 1.000, ask: 1.020, bid_qty: 100.0, ask_qty: 100.0 };
+        let st = SymbolStats::new(60);
+        let p = StrategyParams::default();
+        let q = compute_quotes(&input(&m, &bbo, &st, &p));
+        assert_eq!(q.reason, "ok");
+        assert_eq!(q.bid.unwrap().price, 1.000);
+        assert_eq!(q.ask.unwrap().price, 1.020);
+        assert!(q.fair_shift_bps.abs() < 1e-9);
+    }
+
+    #[test]
     fn withholds_when_spread_narrow() {
         let m = meta();
         let bbo = Bbo { ts: 0, bid: 1.000, ask: 1.0005, bid_qty: 100.0, ask_qty: 100.0 };
         let st = SymbolStats::new(60);
-        let p = StrategyParams::default();
+        let p = plain();
         let q = compute_quotes(&input(&m, &bbo, &st, &p));
         assert_eq!(q.reason, "spread_too_narrow");
         assert!(q.bid.is_none() && q.ask.is_none());
@@ -294,7 +385,7 @@ mod tests {
         let m = meta();
         let bbo = Bbo { ts: 0, bid: 1.000, ask: 1.020, bid_qty: 100.0, ask_qty: 100.0 };
         let st = SymbolStats::new(60);
-        let mut p = StrategyParams::default();
+        let mut p = plain();
         p.quote_mode = "improve".into();
         let q = compute_quotes(&input(&m, &bbo, &st, &p));
         assert_eq!(q.bid.unwrap().price, 1.001);
@@ -306,7 +397,7 @@ mod tests {
         let m = meta();
         let bbo = Bbo { ts: 0, bid: 1.000, ask: 1.020, bid_qty: 100.0, ask_qty: 100.0 };
         let st = SymbolStats::new(60);
-        let p = StrategyParams::default();
+        let p = plain();
         let mut i = input(&m, &bbo, &st, &p);
         i.position_qty = 300.0; // ~303 usd, at the cap
         i.position_avg = 1.0;
@@ -323,10 +414,11 @@ mod tests {
         let m = meta();
         let bbo = Bbo { ts: 0, bid: 1.000, ask: 1.020, bid_qty: 100.0, ask_qty: 100.0 };
         let st = SymbolStats::new(60);
-        let mut p = StrategyParams::default();
+        let mut p = plain();
         p.stale_exit_mode = "taker".into();
         let mut i = input(&m, &bbo, &st, &p);
         i.position_qty = -50.0;
+        i.position_avg = 1.01;
         i.position_age_secs = 1000;
         let q = compute_quotes(&i);
         assert_eq!(q.reason, "stale_exit");
@@ -342,12 +434,81 @@ mod tests {
         let m = meta();
         let bbo = Bbo { ts: 0, bid: 1.000, ask: 1.020, bid_qty: 100.0, ask_qty: 100.0 };
         let st = SymbolStats::new(60);
-        let p = StrategyParams::default();
+        let p = plain();
         let mut i = input(&m, &bbo, &st, &p);
         i.reduce_only = true;
         i.position_qty = 40.0;
+        i.position_avg = 1.0;
         let q = compute_quotes(&i);
         assert!(q.bid.is_none());
         assert_eq!(q.ask.unwrap().qty, 40.0);
+    }
+
+    #[test]
+    fn stop_loss_exits_at_market_when_price_runs_away() {
+        let m = meta();
+        // long from 1.010, market now 0.990/0.992: ~-20 bps against us
+        let bbo = Bbo { ts: 0, bid: 0.990, ask: 0.992, bid_qty: 100.0, ask_qty: 100.0 };
+        let st = SymbolStats::new(60);
+        let mut p = StrategyParams::default();
+        p.stop_loss_bps = 12.0;
+        let mut i = input(&m, &bbo, &st, &p);
+        i.position_qty = 90.0;
+        i.position_avg = 1.010;
+        let q = compute_quotes(&i);
+        assert_eq!(q.reason, "stop_loss");
+        let a = q.ask.unwrap();
+        assert!(a.taker);
+        assert_eq!(a.purpose, Purpose::StopLoss);
+        assert_eq!(a.price, 0.990);
+        assert!(q.bid.is_none());
+        // a small move is tolerated
+        let bbo2 = Bbo { ts: 0, bid: 1.005, ask: 1.025, bid_qty: 100.0, ask_qty: 100.0 };
+        let mut i2 = input(&m, &bbo2, &st, &p);
+        i2.position_qty = 90.0;
+        i2.position_avg = 1.010;
+        assert_ne!(compute_quotes(&i2).reason, "stop_loss");
+    }
+
+    #[test]
+    fn book_imbalance_leans_the_dangerous_side() {
+        let m = meta();
+        // heavy asks, thin bids: price likely to fall -> fair below mid -> bid leans down
+        let bbo = Bbo { ts: 0, bid: 1.000, ask: 1.020, bid_qty: 5.0, ask_qty: 200.0 };
+        let st = SymbolStats::new(60);
+        let mut p = StrategyParams::default();
+        p.imbalance_weight = 1.0;
+        p.max_lean_ticks = 100;
+        let q = compute_quotes(&input(&m, &bbo, &st, &p));
+        assert!(q.fair_shift_bps < 0.0);
+        let b = q.bid.unwrap();
+        assert!(b.price < 1.000, "bid should lean down, got {}", b.price);
+        assert_eq!(q.ask.unwrap().price, 1.020, "ask stays at the touch");
+        // when no leaning is allowed the leaned bid is dropped instead
+        p.max_lean_ticks = 0;
+        let q = compute_quotes(&input(&m, &bbo, &st, &p));
+        assert!(q.bid.is_none());
+        assert_eq!(q.reason, "lean_one_side");
+    }
+
+    #[test]
+    fn reference_deviation_blocks_and_shifts() {
+        let m = meta();
+        let bbo = Bbo { ts: 0, bid: 1.000, ask: 1.020, bid_qty: 100.0, ask_qty: 100.0 };
+        let st = SymbolStats::new(60);
+        let p = StrategyParams::default(); // ref_weight 1, ref_block_bps 4
+        // the leading venue is already 10 bps higher: do not sell, bid may stay
+        let mut i = input(&m, &bbo, &st, &p);
+        i.ref_dev_bps = 10.0;
+        let q = compute_quotes(&i);
+        assert!(q.ask.is_none());
+        assert!(q.bid.is_some());
+        assert_eq!(q.reason, "ref_one_side");
+        // a small positive deviation just shifts fair value: ask leans up by a tick or two
+        let mut i = input(&m, &bbo, &st, &p);
+        i.ref_dev_bps = 3.0;
+        let q = compute_quotes(&i);
+        assert!(q.ask.is_some() && q.bid.is_some(), "{}", q.reason);
+        assert!(q.fair_shift_bps > 2.9 && q.fair_shift_bps < 3.1);
     }
 }

@@ -1,4 +1,5 @@
 pub mod book;
+pub mod binance;
 pub mod bybit;
 pub mod config;
 pub mod eligibility;
