@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPR dashboard</title>
+<script src="/static/plotly.min.js" charset="utf-8"></script>
+<style>
+  :root { --bg:#0f1419; --panel:#161d26; --line:#243040; --fg:#e6edf3; --muted:#8b98a8; --accent:#4fa3ff; --good:#3fb950; --bad:#f85149; --warn:#d29922; }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 13px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:16px; margin:0 12px 0 0; }
+  header select, header button { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:4px 8px; font-size:13px; }
+  .tabs { display:flex; gap:4px; }
+  .tabs button { cursor:pointer; }
+  .tabs button.on { border-color:var(--accent); color:var(--accent); }
+  #status { color:var(--muted); margin-left:auto; }
+  main { padding: 14px 16px 40px; }
+  .tab { display:none; }
+  .tab.on { display:block; }
+  .kpis { display:grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap:10px; margin-bottom:14px; }
+  .kpi { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .kpi .l { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  .kpi .v { font-size:20px; font-weight:600; margin-top:2px; font-variant-numeric: tabular-nums; }
+  .pos { color:var(--good); } .neg { color:var(--bad); } .warn { color:var(--warn); }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:14px; }
+  .panel h2 { font-size:13px; margin:0 0 8px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+  table { width:100%; border-collapse:collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding:4px 8px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:var(--muted); font-weight:600; cursor:pointer; user-select:none; position:sticky; top:0; background:var(--panel); }
+  th.sorted { color:var(--accent); }
+  .scroll { max-height: 520px; overflow:auto; }
+  .badge { display:inline-block; padding:1px 6px; border-radius:10px; font-size:11px; border:1px solid var(--line); color:var(--muted); }
+  .badge.on { border-color:var(--good); color:var(--good); }
+  .badge.high { border-color:var(--bad); color:var(--bad); }
+  .badge.medium { border-color:var(--warn); color:var(--warn); }
+  .badge.low { border-color:var(--accent); color:var(--accent); }
+  .rec { padding:8px 0; border-bottom:1px solid var(--line); }
+  .rec .m { margin:4px 0; }
+  .rec code, .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size:12px; color:var(--fg); }
+  .muted { color:var(--muted); }
+  details summary { cursor:pointer; color:var(--muted); }
+  pre { margin:6px 0 0; white-space:pre-wrap; font-size:11px; color:var(--muted); }
+  .plot { width:100%; height:320px; }
+  .err { color:var(--bad); padding:20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SPR</h1>
+  <select id="run"></select>
+  <div class="tabs">
+    <button data-tab="overview" class="on">Обзор</button>
+    <button data-tab="symbols">Пары</button>
+    <button data-tab="trades">Сделки</button>
+    <button data-tab="recs">Рекомендации</button>
+    <button data-tab="opt">Оптимизатор</button>
+    <button data-tab="events">События</button>
+  </div>
+  <select id="refresh">
+    <option value="3000">обновлять каждые 3 с</option>
+    <option value="10000">каждые 10 с</option>
+    <option value="30000">каждые 30 с</option>
+    <option value="0">не обновлять</option>
+  </select>
+  <span id="status">…</span>
+</header>
+<main>
+  <div id="error" class="err" style="display:none"></div>
+
+  <section class="tab on" id="tab-overview">
+    <div class="kpis" id="kpis"></div>
+    <div class="grid2">
+      <div class="panel"><h2>Капитал и экспозиция</h2><div id="equity" class="plot"></div></div>
+      <div class="panel"><h2>Накопленный результат по кругам</h2><div id="cum" class="plot"></div></div>
+    </div>
+    <div class="grid2">
+      <div class="panel"><h2>Распределение чистого результата за круг, bps</h2><div id="hist" class="plot"></div></div>
+      <div class="panel"><h2>Результат по символам</h2><div class="scroll" id="rt_per_symbol"></div></div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-symbols">
+    <div class="panel"><h2>Все подписанные символы (последний снимок статистики)</h2><div class="scroll" id="symbols"></div></div>
+  </section>
+
+  <section class="tab" id="tab-trades">
+    <div class="grid2">
+      <div class="panel"><h2>Последние круги</h2><div class="scroll" id="roundtrips"></div></div>
+      <div class="panel"><h2>Последние исполнения</h2><div class="scroll" id="fills"></div></div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-recs">
+    <div class="panel"><h2>Открытые рекомендации <span class="muted">(python -m spr_analytics analyze [--apply])</span></h2><div id="recs"></div></div>
+    <div class="panel"><h2>Скоринг пар <span class="muted">(python -m spr_analytics pairs)</span></h2><div class="scroll" id="pairs"></div></div>
+  </section>
+
+  <section class="tab" id="tab-opt">
+    <div class="panel"><h2>Запуски оптимизатора <span class="muted">(python -m spr_analytics optimize)</span></h2><div id="opt"></div></div>
+    <div class="panel"><h2>Текущие параметры ядра</h2><pre id="params"></pre></div>
+  </section>
+
+  <section class="tab" id="tab-events">
+    <div class="panel"><h2>События ядра</h2><div class="scroll" id="events"></div></div>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const state = { run: null, tab: (location.hash || "#overview").slice(1), timer: null, sort: {} };
+const fmt = (v, d = 2) => { if (v === null || v === undefined || Number.isNaN(Number(v))) return "–"; const s = Number(v).toFixed(d); const [i, f] = s.split("."); return i.replace(/\B(?=(\d{3})+(?!\d))/g, "\u202f") + (f ? "." + f : ""); };
+const plot = (id, data, lay, c) => { if (window.Plotly) Plotly.react(id, data, lay, c); else document.getElementById(id).innerHTML = '<div class="muted" style="padding:20px">Plotly не загрузился (нет сети до CDN и не установлен пакет plotly)</div>'; };
+const ts = (ms) => ms ? new Date(ms).toLocaleString("ru-RU", { hour12: false }) : "–";
+const tsShort = (ms) => ms ? new Date(ms).toLocaleTimeString("ru-RU", { hour12: false }) : "–";
+const cls = (v) => v > 0 ? "pos" : v < 0 ? "neg" : "";
+const layout = (extra) => Object.assign({ margin: { l: 50, r: 50, t: 10, b: 40 }, paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)", font: { color: "#8b98a8", size: 11 }, xaxis: { gridcolor: "#243040" }, yaxis: { gridcolor: "#243040" }, showlegend: true, legend: { orientation: "h", y: 1.1 } }, extra || {});
+const cfg = { displayModeBar: false, responsive: true };
+
+async function api(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(`${path}: ${r.status} ${(await r.json().catch(() => ({}))).detail || ""}`);
+  return r.json();
+}
+
+function table(el, rows, cols, key) {
+  const s = state.sort[key] || {};
+  if (s.col) rows = [...rows].sort((a, b) => { const x = a[s.col], y = b[s.col]; const c = (x === y) ? 0 : (x === null || x === undefined) ? 1 : (y === null || y === undefined) ? -1 : (typeof x === "number" ? x - y : String(x).localeCompare(String(y))); return s.dir * c; });
+  let h = "<table><thead><tr>" + cols.map(c => `<th data-col="${c.k}" class="${s.col === c.k ? "sorted" : ""}">${c.t}</th>`).join("") + "</tr></thead><tbody>";
+  for (const r of rows) h += "<tr>" + cols.map(c => `<td class="${c.c ? c.c(r[c.k], r) : ""}">${c.f ? c.f(r[c.k], r) : (r[c.k] ?? "–")}</td>`).join("") + "</tr>";
+  el.innerHTML = h + "</tbody></table>";
+  el.querySelectorAll("th").forEach(th => th.onclick = () => { const col = th.dataset.col; const cur = state.sort[key] || {}; state.sort[key] = { col, dir: cur.col === col ? -cur.dir : -1 }; table(el, rows, cols, key); });
+}
+
+async function loadRuns() {
+  const runs = await api("/api/runs");
+  const sel = $("#run");
+  const prev = sel.value;
+  sel.innerHTML = runs.map(r => `<option value="${r.run_id}">${r.mode} ${ts(r.started_ts)}${r.ended_ts ? "" : " (идёт)"}</option>`).join("");
+  if (prev && runs.some(r => String(r.run_id) === prev)) sel.value = prev;
+  state.run = sel.value ? Number(sel.value) : null;
+}
+
+async function refresh() {
+  try {
+    if (!state.run) await loadRuns();
+    if (!state.run) { $("#status").textContent = "нет запусков"; return; }
+    const q = `?run_id=${state.run}`;
+    $("#error").style.display = "none";
+    if (state.tab === "overview") {
+      const [s, eq, rt] = await Promise.all([api("/api/summary" + q), api("/api/equity" + q), api("/api/roundtrips" + q)]);
+      renderKpis(s, rt.summary);
+      plot("equity", [
+        { x: eq.ts.map(t => new Date(t)), y: eq.equity, name: "капитал", line: { color: "#4fa3ff", width: 1.5 } },
+        { x: eq.ts.map(t => new Date(t)), y: eq.gross_exposure, name: "экспозиция", yaxis: "y2", line: { color: "#d29922", width: 1 } },
+      ], layout({ yaxis2: { overlaying: "y", side: "right", gridcolor: "rgba(0,0,0,0)" } }), cfg);
+      plot("cum", [{ x: rt.cum.ts.map(t => new Date(t)), y: rt.cum.net, name: "чистый результат", line: { color: "#3fb950", width: 1.5 }, fill: "tozeroy", fillcolor: "rgba(63,185,80,0.12)" }], layout({ showlegend: false }), cfg);
+      plot("hist", [{ x: rt.hist.bins, y: rt.hist.counts, type: "bar", marker: { color: rt.hist.bins.map(b => b >= 0 ? "#3fb950" : "#f85149") } }], layout({ showlegend: false, bargap: 0.05 }), cfg);
+      table($("#rt_per_symbol"), rt.per_symbol, [
+        { k: "symbol", t: "символ" }, { k: "n", t: "круги" }, { k: "net_pnl", t: "чистый", f: v => fmt(v), c: cls }, { k: "fees", t: "комиссии", f: v => fmt(v) },
+        { k: "win_rate", t: "прибыльных", f: v => fmt(v * 100, 0) + "%" }, { k: "avg_net_bps", t: "bps/круг", f: v => fmt(v, 1), c: cls },
+        { k: "avg_quoted_spread_bps", t: "спред котир.", f: v => fmt(v, 1) }, { k: "avg_hold_secs", t: "удерж., с", f: v => fmt(v, 0) },
+      ], "rtps");
+    } else if (state.tab === "symbols") {
+      const rows = await api("/api/symbols" + q);
+      table($("#symbols"), rows, [
+        { k: "symbol", t: "символ" },
+        { k: "active", t: "котир.", f: v => `<span class="badge ${v ? "on" : ""}">${v ? "да" : "нет"}</span>` },
+        { k: "reason", t: "фильтр" }, { k: "quote_reason", t: "котировка" }, { k: "score", t: "score", f: v => fmt(v, 1) },
+        { k: "spread_med_bps", t: "спред мед., bps", f: v => fmt(v, 2) }, { k: "vol_bps", t: "вола, bps/мин", f: v => fmt(v, 1) },
+        { k: "trades_per_min", t: "сделок/мин", f: v => fmt(v, 1) }, { k: "turnover_24h", t: "оборот 24ч", f: v => fmt(v / 1e6, 1) + "M" },
+        { k: "bid", t: "bid", f: v => v }, { k: "ask", t: "ask", f: v => v },
+        { k: "position_qty", t: "позиция", f: v => fmt(v, 3), c: cls }, { k: "unrealized", t: "нереализ.", f: v => fmt(v), c: cls },
+        { k: "net", t: "чистый", f: v => fmt(v), c: cls }, { k: "n_fills", t: "исполн." },
+      ], "symbols");
+    } else if (state.tab === "trades") {
+      const [rt, fills] = await Promise.all([api("/api/roundtrips" + q), api("/api/fills" + q + "&limit=300")]);
+      table($("#roundtrips"), rt.recent, [
+        { k: "exit_ts", t: "выход", f: tsShort }, { k: "symbol", t: "символ" }, { k: "direction", t: "напр." }, { k: "qty", t: "кол-во", f: v => fmt(v, 3) },
+        { k: "entry_price", t: "вход", f: v => v }, { k: "exit_price", t: "выход", f: v => v }, { k: "net_pnl", t: "чистый", f: v => fmt(v, 4), c: cls },
+        { k: "net_bps", t: "bps", f: v => fmt(v, 1), c: cls }, { k: "hold_secs", t: "с", f: v => fmt(v, 0) }, { k: "exit_purpose", t: "тип выхода" },
+      ], "rts");
+      table($("#fills"), fills, [
+        { k: "ts", t: "время", f: tsShort }, { k: "symbol", t: "символ" }, { k: "side", t: "сторона" }, { k: "purpose", t: "цель" },
+        { k: "price", t: "цена", f: v => v }, { k: "qty", t: "кол-во", f: v => fmt(v, 3) }, { k: "fee", t: "комиссия", f: v => fmt(v, 4) },
+        { k: "realized_pnl", t: "реализ.", f: v => fmt(v, 4), c: cls }, { k: "spread_bps_at_place", t: "спред при выст.", f: v => fmt(v, 1) },
+        { k: "queue_ahead_initial", t: "очередь", f: v => fmt(v, 2) }, { k: "is_maker", t: "мейкер", f: v => v ? "да" : "нет" },
+      ], "fills");
+    } else if (state.tab === "recs") {
+      const [recs, pairs] = await Promise.all([api("/api/recommendations"), api("/api/pair_scores")]);
+      $("#recs").innerHTML = recs.length ? recs.map(r => `<div class="rec"><span class="badge ${r.severity}">${r.severity}</span> <b>${r.rule}</b> <span class="muted">${r.symbol || "все символы"} · ${ts(r.created_ts)}</span><div class="m">${r.message}</div>${r.param ? `<div><code>${r.param}: ${r.current_value ?? ""} → ${r.suggested_value ?? ""}</code></div>` : ""}<details><summary>данные</summary><pre>${r.evidence_json || ""}</pre></details></div>`).join("") : `<div class="muted">Пока нет. Запустите <code>python -m spr_analytics analyze</code>.</div>`;
+      table($("#pairs"), pairs, [
+        { k: "symbol", t: "символ" }, { k: "verdict", t: "вердикт" }, { k: "score", t: "score", f: v => fmt(v, 2) }, { k: "spread_med_bps", t: "спред, bps", f: v => fmt(v, 2) },
+        { k: "trades_per_min", t: "сделок/мин", f: v => fmt(v, 1) }, { k: "vol_bps", t: "вола", f: v => fmt(v, 1) }, { k: "realized_pnl", t: "результат", f: v => fmt(v), c: cls }, { k: "n_roundtrips", t: "круги" },
+      ], "pairs");
+    } else if (state.tab === "opt") {
+      const [opt, params] = await Promise.all([api("/api/optimizer"), api("/api/params" + q)]);
+      $("#opt").innerHTML = opt.length ? opt.map(o => `<div class="rec"><span class="badge ${o.applied ? "on" : ""}">${o.applied ? "применено" : "не применено"}</span> <b>${o.symbol}</b> <span class="muted">${ts(o.created_ts)} · ${o.n_trials} попыток</span><div class="m">train ${fmt(o.train_score)} · valid ${fmt(o.valid_score)} · baseline valid ${fmt(o.baseline_valid_score)} — ${o.note || ""}</div><details><summary>лучшие параметры</summary><pre>${JSON.stringify(o.best_params, null, 1)}</pre></details></div>`).join("") : `<div class="muted">Пока нет запусков.</div>`;
+      $("#params").textContent = JSON.stringify(params, null, 1);
+    } else if (state.tab === "events") {
+      const ev = await api("/api/events" + q + "&limit=300");
+      table($("#events"), ev, [{ k: "ts", t: "время", f: ts }, { k: "level", t: "уровень", c: v => v === "error" ? "neg" : v === "warn" ? "warn" : "" }, { k: "msg", t: "сообщение", f: v => `<span style="white-space:normal">${v}</span>` }], "events");
+    }
+    $("#status").textContent = "обновлено " + new Date().toLocaleTimeString("ru-RU", { hour12: false });
+  } catch (e) {
+    $("#error").style.display = "block";
+    $("#error").textContent = String(e.message || e);
+    $("#status").textContent = "ошибка";
+  }
+}
+
+function renderKpis(s, rt) {
+  const sn = s.snapshot || {};
+  const k = [
+    ["капитал", fmt(sn.equity), ""],
+    ["реализовано", fmt(sn.realized), cls(sn.realized)],
+    ["комиссии", fmt(sn.fees), ""],
+    ["нереализовано", fmt(sn.unrealized), cls(sn.unrealized)],
+    ["за день", fmt(sn.daily_pnl), cls(sn.daily_pnl)],
+    ["макс. просадка", fmt(sn.max_drawdown), sn.max_drawdown > 0 ? "neg" : ""],
+    ["круги / прибыльных", `${rt.n} / ${fmt((rt.win_rate || 0) * 100, 0)}%`, ""],
+    ["bps за круг", fmt(rt.avg_net_bps, 1), cls(rt.avg_net_bps)],
+    ["позиций", sn.open_positions ?? "–", ""],
+    ["ордеров в стакане", sn.n_live_orders ?? "–", ""],
+    ["активных пар", `${sn.n_active_symbols ?? "–"} / ${s.n_symbols}`, ""],
+    ["исполнений / доля", `${s.n_fills} / ${fmt(s.fill_ratio * 100, 1)}%`, ""],
+    ["состояние", sn.halted ? "СТОП (дневной лимит)" : (s.run && !s.run.ended_ts ? "работает" : "завершён"), sn.halted ? "neg" : ""],
+    ["параметры v", s.param_version ? s.param_version.version : "–", ""],
+    ["рекомендаций", s.open_recommendations, s.open_recommendations ? "warn" : ""],
+    ["снимок", tsShort(sn.ts), ""],
+  ];
+  $("#kpis").innerHTML = k.map(([l, v, c]) => `<div class="kpi"><div class="l">${l}</div><div class="v ${c}">${v}</div></div>`).join("");
+}
+
+function setTab(t) {
+  state.tab = t;
+  history.replaceState(null, "", "#" + t);
+  document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === t));
+  document.querySelectorAll(".tab").forEach(s => s.classList.toggle("on", s.id === "tab-" + t));
+  refresh();
+}
+function schedule() {
+  if (state.timer) clearInterval(state.timer);
+  const ms = Number($("#refresh").value);
+  if (ms > 0) state.timer = setInterval(() => { if (document.visibilityState === "visible") refresh(); }, ms);
+}
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => setTab(b.dataset.tab));
+$("#run").onchange = () => { state.run = Number($("#run").value); refresh(); };
+$("#refresh").onchange = schedule;
+setTab(["overview","symbols","trades","recs","opt","events"].includes(state.tab) ? state.tab : "overview");
+loadRuns().then(refresh).catch(e => { $("#error").style.display = "block"; $("#error").textContent = String(e.message || e); });
+setInterval(loadRuns, 30000);
+schedule();
+</script>
+</body>
+</html>

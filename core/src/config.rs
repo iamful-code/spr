@@ -323,7 +323,7 @@ impl Overrides {
         if text.trim().is_empty() {
             return Ok(Overrides::default());
         }
-        Ok(serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?)
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
     pub fn resolve(&self, base: &StrategyParams, symbol: &str) -> Result<StrategyParams> {
@@ -358,7 +358,7 @@ impl SymbolLists {
         if text.trim().is_empty() {
             return Ok(SymbolLists::default());
         }
-        Ok(serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?)
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 }
 

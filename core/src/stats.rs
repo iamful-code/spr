@@ -180,7 +180,9 @@ mod tests {
         let mut s = SymbolStats::new(60);
         let t0 = 1_700_000_000_000i64;
         for i in 0..60 {
-            let bbo = Bbo { ts: t0 + i * 1000, bid: 100.0, ask: 100.0 + 0.01 * (1 + (i % 3)) as f64, bid_qty: 1.0, ask_qty: 1.0 };
+            // keep the mid constant so volatility stays at zero: only the spread cycles
+            let half = 0.005 * (1 + (i % 3)) as f64;
+            let bbo = Bbo { ts: t0 + i * 1000, bid: 100.0 - half, ask: 100.0 + half, bid_qty: 1.0, ask_qty: 1.0 };
             s.on_bbo(&bbo, t0 + i * 1000);
             if i % 2 == 0 {
                 s.on_trade(&Trade { ts: t0 + i * 1000, price: 100.0, qty: 1.0, taker_side: Side::Buy }, t0 + i * 1000);

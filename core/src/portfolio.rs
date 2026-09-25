@@ -1,6 +1,6 @@
 //! Positions and PnL with average-cost accounting per symbol.
 
-use crate::types::{Fill, Side, SymbolId};
+use crate::types::{Fill, SymbolId};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default)]
@@ -168,7 +168,7 @@ impl Portfolio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Purpose;
+    use crate::types::{Purpose, Side};
 
     fn fill(side: Side, price: f64, qty: f64, ts: i64) -> Fill {
         Fill {

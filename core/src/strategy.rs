@@ -119,7 +119,13 @@ pub fn compute_quotes(inp: &QuoteInput) -> Quotes {
     };
     let skew_bps = p.inventory_skew_bps * inv_ratio;
     if skew_bps.abs() > 0.0 && tick_bps > 0.0 {
-        let skew_ticks = (skew_bps / tick_bps).round() * meta.tick_size;
+        let mut ticks = (skew_bps / tick_bps).round();
+        // With a coarse tick the skew can round to nothing; once the position is at
+        // least half the cap we still want to lean by one tick so inventory unwinds.
+        if ticks == 0.0 && inv_ratio.abs() >= 0.5 {
+            ticks = inv_ratio.signum();
+        }
+        let skew_ticks = ticks * meta.tick_size;
         // long => push both quotes down (sell sooner, buy later); short => push up
         bid_px -= skew_ticks;
         ask_px -= skew_ticks;

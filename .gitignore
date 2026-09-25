@@ -17,3 +17,6 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .optuna/
+
+# per-machine instrument cache (spr symbols --out)
+config/instruments.json

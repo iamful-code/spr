@@ -215,11 +215,11 @@ impl PaperExchange {
 
     /// Activate pending orders and finalize cancels whose latency elapsed.
     pub fn on_time(&mut self, now: i64) {
-        let ids: Vec<u64> = self.orders.iter().filter(|(_, o)| o.state == State::Pending && o.ts_active <= now || o.cancel_at.map_or(false, |c| c <= now)).map(|(id, _)| *id).collect();
+        let ids: Vec<u64> = self.orders.iter().filter(|(_, o)| o.state == State::Pending && o.ts_active <= now || o.cancel_at.is_some_and(|c| c <= now)).map(|(id, _)| *id).collect();
         for id in ids {
             let (pending_activation, cancel_due) = {
                 let o = &self.orders[&id];
-                (o.state == State::Pending && o.ts_active <= now, o.cancel_at.map_or(false, |c| c <= now))
+                (o.state == State::Pending && o.ts_active <= now, o.cancel_at.is_some_and(|c| c <= now))
             };
             if cancel_due {
                 let st = if self.orders[&id].filled > 0.0 { "partial_cancelled" } else { "cancelled" };
