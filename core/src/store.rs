@@ -4,11 +4,12 @@
 //! Messages are written in batches inside one transaction.
 
 use crate::recorder::{BboRec, Recorder, TrdRec};
-use crate::types::{Fill, OrderDone, SymbolMeta};
+use crate::types::{now_ms, Fill, OrderDone, SymbolMeta};
 use anyhow::{Context, Result};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use rusqlite::{params, Connection};
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -73,7 +74,14 @@ pub struct StoreHandle {
 impl StoreHandle {
     pub fn send(&self, msg: StoreMsg) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(msg);
+            if tx.send(msg).is_err() {
+                static LAST_WARN: AtomicI64 = AtomicI64::new(0);
+                let now = now_ms();
+                if now - LAST_WARN.load(Ordering::Relaxed) > 60_000 {
+                    LAST_WARN.store(now, Ordering::Relaxed);
+                    tracing::error!("store thread is gone: nothing is being written to the database or market data files");
+                }
+            }
         }
     }
     pub fn is_null(&self) -> bool {
@@ -237,7 +245,7 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "busy_timeout", 30_000)?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }
@@ -249,25 +257,25 @@ pub fn open_store(db_path: &Path, md_dir: &Path, run_id: i64, symbols: Vec<Symbo
     let (tx, rx) = unbounded::<StoreMsg>();
     let join = std::thread::Builder::new()
         .name("spr-store".into())
-        .spawn(move || {
-            if let Err(e) = writer_loop(conn, recorder, run_id, rx) {
-                tracing::error!("store thread failed: {e:#}");
-            }
-        })
+        .spawn(move || writer_loop(conn, recorder, run_id, rx))
         .context("spawning store thread")?;
     Ok(Store { handle: StoreHandle { tx: Some(tx) }, join: Some(join) })
 }
 
-fn writer_loop(mut conn: Connection, mut recorder: Option<Recorder>, run_id: i64, rx: Receiver<StoreMsg>) -> Result<()> {
+fn writer_loop(mut conn: Connection, mut recorder: Option<Recorder>, run_id: i64, rx: Receiver<StoreMsg>) {
     let mut batch: Vec<StoreMsg> = Vec::with_capacity(2048);
     let mut shutdown = false;
+    let mut consecutive_failures = 0u32;
+    let mut md_error_logged_ms = 0i64;
     while !shutdown {
         batch.clear();
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(m) => batch.push(m),
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(r) = recorder.as_mut() {
-                    r.flush()?;
+                    if let Err(e) = r.flush() {
+                        tracing::error!("market data flush failed: {e:#}");
+                    }
                 }
                 continue;
             }
@@ -280,35 +288,79 @@ fn writer_loop(mut conn: Connection, mut recorder: Option<Recorder>, run_id: i64
                 Err(_) => break,
             }
         }
-        let tx = conn.transaction()?;
-        for m in batch.drain(..) {
-            match m {
-                StoreMsg::Shutdown => shutdown = true,
-                StoreMsg::MdBbo(r) => {
-                    if let Some(rec) = recorder.as_mut() {
-                        rec.write_bbo(&r)?;
+        if batch.iter().any(|m| matches!(m, StoreMsg::Shutdown)) {
+            shutdown = true;
+        }
+        // 1. Market data files: independent of SQLite, an error here never stops the rows.
+        if let Some(rec) = recorder.as_mut() {
+            for m in &batch {
+                let r = match m {
+                    StoreMsg::MdBbo(b) => rec.write_bbo(b),
+                    StoreMsg::MdTrade(t) => rec.write_trade(t),
+                    _ => Ok(()),
+                };
+                if let Err(e) = r {
+                    let now = now_ms();
+                    if now - md_error_logged_ms > 60_000 {
+                        md_error_logged_ms = now;
+                        tracing::error!("market data write failed (disk full?): {e:#}");
                     }
+                    break;
                 }
-                StoreMsg::MdTrade(r) => {
-                    if let Some(rec) = recorder.as_mut() {
-                        rec.write_trade(&r)?;
-                    }
-                }
-                other => write_row(&tx, run_id, other)?,
+            }
+            if let Err(e) = rec.flush() {
+                tracing::error!("market data flush failed: {e:#}");
             }
         }
-        tx.commit()?;
-        if let Some(r) = recorder.as_mut() {
-            r.flush()?;
+        // 2. Database rows in one transaction, retried on transient errors such as
+        //    SQLITE_BUSY while the analytics side is writing. The thread never exits
+        //    because of a write error: at worst one batch is dropped and logged.
+        let n_rows = batch.iter().filter(|m| !matches!(m, StoreMsg::MdBbo(_) | StoreMsg::MdTrade(_) | StoreMsg::Shutdown)).count();
+        if n_rows > 0 {
+            let mut attempt = 0u32;
+            loop {
+                match write_batch(&mut conn, run_id, &batch) {
+                    Ok(()) => {
+                        if consecutive_failures > 0 {
+                            tracing::info!("database writes recovered after {consecutive_failures} failed attempts");
+                        }
+                        consecutive_failures = 0;
+                        break;
+                    }
+                    Err(e) => {
+                        attempt += 1;
+                        consecutive_failures += 1;
+                        if attempt >= 5 {
+                            tracing::error!("dropping {n_rows} database rows after {attempt} failed attempts: {e:#}");
+                            break;
+                        }
+                        tracing::warn!("database write failed (attempt {attempt}): {e:#}; retrying in 1s");
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            }
         }
     }
     if let Some(r) = recorder.as_mut() {
-        r.flush()?;
+        if let Err(e) = r.flush() {
+            tracing::error!("market data flush failed: {e:#}");
+        }
     }
+}
+
+fn write_batch(conn: &mut Connection, run_id: i64, batch: &[StoreMsg]) -> Result<()> {
+    let tx = conn.transaction()?;
+    for m in batch {
+        match m {
+            StoreMsg::MdBbo(_) | StoreMsg::MdTrade(_) | StoreMsg::Shutdown => {}
+            other => write_row(&tx, run_id, other)?,
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
-fn write_row(tx: &rusqlite::Transaction, run_id: i64, m: StoreMsg) -> Result<()> {
+fn write_row(tx: &rusqlite::Transaction, run_id: i64, m: &StoreMsg) -> Result<()> {
     match m {
         StoreMsg::RunStart { started_ts, mode, config_json, symbols_json } => {
             tx.prepare_cached("INSERT OR REPLACE INTO runs(run_id, started_ts, mode, config_json, symbols_json) VALUES (?1, ?2, ?3, ?4, ?5)")?
@@ -423,7 +475,7 @@ fn write_row(tx: &rusqlite::Transaction, run_id: i64, m: StoreMsg) -> Result<()>
         }
         StoreMsg::ParamVersion { version, ts, params_json } => {
             tx.prepare_cached("INSERT OR REPLACE INTO param_versions(run_id, version, ts, params_json) VALUES (?1, ?2, ?3, ?4)")?
-                .execute(params![run_id, version as i64, ts, params_json])?;
+                .execute(params![run_id, *version as i64, ts, params_json])?;
         }
         StoreMsg::Shutdown | StoreMsg::MdBbo(_) | StoreMsg::MdTrade(_) => {}
     }

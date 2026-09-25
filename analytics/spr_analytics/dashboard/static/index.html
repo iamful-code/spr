@@ -215,6 +215,9 @@ async function refresh() {
 
 function renderKpis(s, rt) {
   const sn = s.snapshot || {};
+  const running = s.run && !s.run.ended_ts;
+  const staleMin = sn.ts ? (s.now - sn.ts) / 60000 : 0;
+  const stale = running && staleMin > 1;
   const k = [
     ["капитал", fmt(sn.equity), ""],
     ["реализовано", fmt(sn.realized), cls(sn.realized)],
@@ -228,10 +231,10 @@ function renderKpis(s, rt) {
     ["ордеров в стакане", sn.n_live_orders ?? "–", ""],
     ["активных пар", `${sn.n_active_symbols ?? "–"} / ${s.n_symbols}`, ""],
     ["исполнений / доля", `${s.n_fills} / ${fmt(s.fill_ratio * 100, 1)}%`, ""],
-    ["состояние", sn.halted ? "СТОП (дневной лимит)" : (s.run && !s.run.ended_ts ? "работает" : "завершён"), sn.halted ? "neg" : ""],
+    ["состояние", sn.halted ? "СТОП (дневной лимит)" : stale ? "нет записи в БД" : (running ? "работает" : "завершён"), (sn.halted || stale) ? "neg" : ""],
     ["параметры v", s.param_version ? s.param_version.version : "–", ""],
     ["рекомендаций", s.open_recommendations, s.open_recommendations ? "warn" : ""],
-    ["снимок", tsShort(sn.ts), ""],
+    ["снимок", tsShort(sn.ts) + (stale ? ` (${Math.round(staleMin)} мин назад)` : ""), stale ? "neg" : ""],
   ];
   $("#kpis").innerHTML = k.map(([l, v, c]) => `<div class="kpi"><div class="l">${l}</div><div class="v ${c}">${v}</div></div>`).join("");
 }

@@ -21,9 +21,9 @@ def now_ms() -> int:
 
 def connect(path: str = DEFAULT_DB, readonly: bool = False) -> sqlite3.Connection:
     if readonly:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
     else:
-        conn = sqlite3.connect(path, timeout=5)
+        conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
