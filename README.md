@@ -44,6 +44,26 @@ pip install -e analytics
 Все команды ниже запускаются из корня репозитория: пути `data/spr.db`, `data/md`,
 `config/*.json` в конфиге относительные.
 
+### Windows (PowerShell)
+
+В PowerShell 5.1 нет `&&`: команды выполняются по одной или через `;`. Бинарь ядра —
+`.\core\target\release\spr.exe`, активация окружения — `.\.venv\Scripts\Activate.ps1`.
+
+```powershell
+git clone -b claude/elegant-ride-3lf3dw https://github.com/iamful-code/spr.git
+cd spr
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1   # сборка ядра + .venv + пакет аналитики
+
+.\.venv\Scripts\Activate.ps1          # если ругается на политику: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+.\core\target\release\spr.exe sim --symbols 30 --duration-secs 900 --speed 0
+python -m spr_analytics analyze
+uvicorn spr_analytics.dashboard.app:app --port 8000
+```
+
+Для сборки на Windows нужен Rust с MSVC-тулчейном (rustup.rs) и «Visual Studio Build
+Tools» с компонентом «Разработка классических приложений на C++» (`rusqlite` компилирует
+SQLite из исходников).
+
 ## Быстрый старт без сети
 
 ```bash

@@ -94,7 +94,9 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let filter = cli.log.clone().or_else(|| std::env::var("RUST_LOG").ok()).unwrap_or_else(|| "info".into());
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new(filter)).with_target(false).with_writer(std::io::stderr).init();
+    // the legacy Windows console prints ANSI colour codes as garbage; SPR_COLOR=1 forces them on
+    let ansi = std::env::var("SPR_COLOR").map(|v| v == "1").unwrap_or(!cfg!(windows));
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new(filter)).with_target(false).with_ansi(ansi).with_writer(std::io::stderr).init();
 
     match cli.cmd {
         Cmd::Run { instruments_file, symbols, max_symbols, no_record, duration_secs } => {
