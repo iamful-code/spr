@@ -127,7 +127,8 @@ def strategy_params_for(params_blob: dict, symbol: str) -> dict:
 def write_recommendations(conn: sqlite3.Connection, run_id: int | None, recs: list[dict]) -> int:
     ts = now_ms()
     with conn:
-        conn.execute("UPDATE recommendations SET status = 'superseded' WHERE status = 'open' AND (run_id = ? OR ? IS NULL)", (run_id, run_id))
+        # a new analysis replaces everything that was open, including leftovers of earlier runs
+        conn.execute("UPDATE recommendations SET status = 'superseded' WHERE status = 'open'")
         conn.executemany(
             "INSERT INTO recommendations(created_ts, run_id, symbol, rule, severity, message, param, current_value, suggested_value, evidence_json, status)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')",

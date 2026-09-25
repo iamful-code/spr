@@ -117,6 +117,9 @@ pub struct StrategyParams {
     pub stop_loss_bps: f64,
     /// "taker" (cross the spread) or "improve" (one tick inside) for stop-loss exits.
     pub stop_loss_mode: String,
+    /// quote_mode = "inside": keep at least this share of the touch half-spread between our
+    /// quote and the mid (so a 200 bps spread is quoted 100 bps wide, not `min_spread_bps`).
+    pub inside_spread_frac: f64,
 }
 
 impl Default for StrategyParams {
@@ -124,7 +127,7 @@ impl Default for StrategyParams {
         Self {
             min_spread_bps: 10.0,
             min_edge_bps: 3.0,
-            quote_mode: "join".into(),
+            quote_mode: "inside".into(),
             order_notional_usd: 100.0,
             max_position_notional_usd: 300.0,
             inventory_skew_bps: 4.0,
@@ -142,6 +145,7 @@ impl Default for StrategyParams {
             max_lean_ticks: 3,
             stop_loss_bps: 12.0,
             stop_loss_mode: "taker".into(),
+            inside_spread_frac: 0.8,
         }
     }
 }
@@ -166,7 +170,8 @@ impl StrategyParams {
         anyhow::ensure!(self.min_spread_bps > 0.0, "min_spread_bps must be > 0");
         anyhow::ensure!(self.order_notional_usd > 0.0, "order_notional_usd must be > 0");
         anyhow::ensure!(self.max_position_notional_usd >= self.order_notional_usd, "max_position_notional_usd must be >= order_notional_usd");
-        anyhow::ensure!(self.quote_mode == "join" || self.quote_mode == "improve", "quote_mode must be join|improve");
+        anyhow::ensure!(self.quote_mode == "join" || self.quote_mode == "improve" || self.quote_mode == "inside", "quote_mode must be join|improve|inside");
+        anyhow::ensure!((0.0..=1.0).contains(&self.inside_spread_frac), "inside_spread_frac in 0..1");
         anyhow::ensure!(self.stale_exit_mode == "improve" || self.stale_exit_mode == "taker", "stale_exit_mode must be improve|taker");
         anyhow::ensure!(self.toxicity_window_secs >= 1 && self.toxicity_window_secs <= 300, "toxicity_window_secs in 1..300");
         anyhow::ensure!((0.0..=1.0).contains(&self.imbalance_weight), "imbalance_weight in 0..1");
@@ -225,7 +230,7 @@ fn d_min_spread_med() -> f64 {
     10.0
 }
 fn d_min_tpm() -> f64 {
-    3.0
+    1.0
 }
 fn d_min_svr() -> f64 {
     0.8
@@ -263,7 +268,7 @@ fn d_ref_providers() -> Vec<String> {
     vec!["binance_futures".into(), "bybit_spot".into()]
 }
 fn d_ref_stale() -> i64 {
-    3000
+    30_000
 }
 fn d_ref_per_conn() -> usize {
     100
@@ -511,7 +516,7 @@ mod tests {
         assert_eq!(p.min_spread_bps, 15.0);
         assert_eq!(p.quote_mode, "improve");
         let q = ov.resolve(&base, "ETHUSDT").unwrap();
-        assert_eq!(q.quote_mode, "join");
+        assert_eq!(q.quote_mode, "inside");
         assert_eq!(q.min_spread_bps, 15.0);
         let mut bad = serde_json::Map::new();
         bad.insert("quote_mode".into(), serde_json::json!("weird"));
@@ -523,5 +528,6 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.exchange.category, "linear");
         assert_eq!(cfg.strategy.min_spread_bps, 10.0);
+        assert_eq!(cfg.strategy.quote_mode, "inside");
     }
 }

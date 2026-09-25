@@ -842,10 +842,13 @@ mod tests {
         }
         assert!(e.symbols[0].verdict.eligible, "reason={}", e.symbols[0].verdict.reason);
         assert!(e.symbols[0].active);
-        // after the next quote both sides should rest in the paper book
-        now += 1000;
-        e.on_market(MarketEvent::Bbo { sym: 0, bbo: Bbo { ts: now, ..bbo } }, now);
-        e.on_time(now + 20);
+        // after the next quotes both sides should rest in the paper book (two steps: an
+        // order that just aged out is re-placed only once its cancel has gone through)
+        for _ in 0..2 {
+            now += 1000;
+            e.on_market(MarketEvent::Bbo { sym: 0, bbo: Bbo { ts: now, ..bbo } }, now);
+            e.on_time(now + 20);
+        }
         assert!(e.symbols[0].bid_order.is_some() && e.symbols[0].ask_order.is_some(), "{}", e.symbols[0].quote_reason);
         // a seller sweeps through our bid, then a buyer lifts through our ask: one round trip
         e.on_market(MarketEvent::Trades { sym: 0, trades: vec![Trade { ts: now + 30, price: 0.999, qty: 500.0, taker_side: Side::Sell }] }, now + 30);
@@ -871,10 +874,13 @@ mod tests {
             e.on_market(MarketEvent::Bbo { sym: 0, bbo: Bbo { ts: now, ..bbo } }, now);
             e.on_market(MarketEvent::Trades { sym: 0, trades: vec![Trade { ts: now, price: 1.010, qty: 1.0, taker_side: if i % 2 == 0 { Side::Buy } else { Side::Sell } }] }, now + 1);
         }
-        now += 1000;
-        e.on_market(MarketEvent::Bbo { sym: 0, bbo: Bbo { ts: now, ..bbo } }, now);
-        e.on_time(now + 20);
-        // fill our bid then crash the market: unrealized loss trips the daily limit
+        for _ in 0..2 {
+            now += 1000;
+            e.on_market(MarketEvent::Bbo { sym: 0, bbo: Bbo { ts: now, ..bbo } }, now);
+            e.on_time(now + 20);
+        }
+        assert!(e.symbols[0].bid_order.is_some(), "{}", e.symbols[0].quote_reason);
+        // fill our bid then crash the market: the loss trips the daily limit
         e.on_market(MarketEvent::Trades { sym: 0, trades: vec![Trade { ts: now + 30, price: 0.999, qty: 500.0, taker_side: Side::Sell }] }, now + 30);
         let crash = Bbo { ts: now + 2000, bid: 0.900, ask: 0.920, bid_qty: 50.0, ask_qty: 50.0 };
         e.on_market(MarketEvent::Bbo { sym: 0, bbo: crash }, now + 2000);

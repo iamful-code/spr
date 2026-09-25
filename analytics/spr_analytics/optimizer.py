@@ -60,7 +60,8 @@ def suggest_params(trial, base: dict) -> dict:
     return {
         "min_spread_bps": trial.suggest_float("min_spread_bps", 4.0, 40.0, log=True),
         "min_edge_bps": trial.suggest_float("min_edge_bps", 0.0, 10.0),
-        "quote_mode": trial.suggest_categorical("quote_mode", ["join", "improve"]),
+        "quote_mode": trial.suggest_categorical("quote_mode", ["join", "improve", "inside"]),
+        "inside_spread_frac": trial.suggest_float("inside_spread_frac", 0.2, 0.8),
         "order_notional_usd": order_notional,
         "max_position_notional_usd": order_notional * trial.suggest_float("position_cap_mult", 1.0, 5.0),
         "inventory_skew_bps": trial.suggest_float("inventory_skew_bps", 0.0, 15.0),

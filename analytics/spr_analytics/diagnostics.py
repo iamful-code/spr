@@ -17,6 +17,7 @@ from . import db, markouts, roundtrips
 
 RULES_DOC = {
     "back_of_queue": "Исполнения из хвоста очереди токсичны, а из головы — нет: нужен приоритет в очереди",
+    "inside_too_tight": "Внутренние котировки чистые по markout'у, но захваченный спред не покрывает комиссии: сохранять большую долю спреда",
     "adverse_selection": "Markout через 5 с после входа хуже, чем −0.5 × полуспреда: нас переезжает информированный поток",
     "low_fill_ratio": "Мало исполнений при большой очереди впереди: котировки не доходят до сделки",
     "stale_holding": "Позиции держатся почти до max_hold_secs и выходы убыточны: инвентарь копится",
@@ -127,11 +128,11 @@ def run_diagnostics(conn: sqlite3.Connection, md_dir: str, run_id: int, min_n: i
             order_notional = float(p.get("order_notional_usd", 100.0))
             if fill_ratio < 0.05 and qa.mean() > 3 * order_notional:
                 mode = p.get("quote_mode", "join")
-                if mode == "join":
+                if mode in ("join", "improve"):
                     recs.append({
                         "symbol": symbol, "rule": "low_fill_ratio", "severity": "medium",
-                        "message": f"{symbol}: исполняется {fill_ratio:.1%} ордеров, впереди в очереди в среднем {qa.mean():.0f} USDT. Встать на тик внутрь спреда.",
-                        "param": "quote_mode", "current_value": mode, "suggested_value": "improve",
+                        "message": f"{symbol}: исполняется {fill_ratio:.1%} ордеров, впереди в очереди в среднем {qa.mean():.0f} USDT. Котировать только внутри спреда (inside).",
+                        "param": "quote_mode", "current_value": mode, "suggested_value": "inside",
                         "evidence": {"fill_ratio": fill_ratio, "queue_ahead_usd": float(qa.mean()), "n_orders": int(len(decided))},
                     })
                 else:
@@ -184,6 +185,19 @@ def run_diagnostics(conn: sqlite3.Connection, md_dir: str, run_id: int, min_n: i
                     "param": "min_spread_bps", "current_value": cur, "suggested_value": _round_sig(cur * 1.2),
                     "evidence": {"quoted_bps": quoted, "captured_bps": captured, "n": n_rt},
                 })
+            # 5b. inside quotes are clean but capture too little of the spread
+            if p.get("quote_mode") == "inside":
+                sym_mo = mo_sym[mo_sym["symbol"] == symbol] if len(mo_sym) else mo_sym
+                mo5 = float(sym_mo.iloc[0]["mo_5s"]) if len(sym_mo) and np.isfinite(sym_mo.iloc[0].get("mo_5s", np.nan)) else 0.0
+                fee_bps = 4.0
+                frac = float(p.get("inside_spread_frac", 0.8))
+                if captured < 1.5 * fee_bps and mo5 > -1.0 and frac < 0.95:
+                    recs.append({
+                        "symbol": symbol, "rule": "inside_too_tight", "severity": "medium",
+                        "message": f"{symbol}: внутри спреда исполнения чистые (markout 5с {mo5:.1f} bps), но захват {captured:.1f} bps за круг едва покрывает комиссии. Держать большую долю спреда.",
+                        "param": "inside_spread_frac", "current_value": frac, "suggested_value": _round_sig(min(0.95, frac + 0.1)),
+                        "evidence": {"captured_bps": captured, "markout_5s": mo5, "n": n_rt},
+                    })
             # 6. fee heavy
             gross = float(srt["gross_pnl"].sum())
             fees = float(srt["fees"].sum())
@@ -225,11 +239,11 @@ def run_diagnostics(conn: sqlite3.Connection, md_dir: str, run_id: int, min_n: i
             mf = float((front["mo_5s"] * front["n"]).sum() / front["n"].sum())
             if mb < -1.0 and mf - mb > 2.0:
                 base = params_blob.get("strategy", {})
-                if base.get("quote_mode", "join") == "join":
+                if base.get("quote_mode", "join") in ("join", "improve"):
                     recs.append({
                         "symbol": None, "rule": "back_of_queue", "severity": "high",
-                        "message": f"Входы из хвоста очереди дают markout {mb:.1f} bps, из головы {mf:.1f} bps. Нужен приоритет: котировать на тик внутрь спреда.",
-                        "param": "quote_mode", "current_value": "join", "suggested_value": "improve",
+                        "message": f"Входы из хвоста очереди дают markout {mb:.1f} bps, из головы {mf:.1f} bps. Нужен приоритет: котировать только внутри спреда (inside).",
+                        "param": "quote_mode", "current_value": base.get("quote_mode", "join"), "suggested_value": "inside",
                         "evidence": {"markout_back_bps": mb, "markout_front_bps": mf, "n_back": int(back["n"].sum()), "n_front": int(front["n"].sum())},
                     })
     # 8. kill switch
